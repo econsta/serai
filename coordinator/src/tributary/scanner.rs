@@ -198,7 +198,7 @@ pub(crate) async fn scan_tributaries_task<
             let reader = tributary.reader();
             loop {
               // Check if the set was retired, and if so, don't further operate
-              if crate::MainDb::<D>::is_tributary_retired(&raw_db, spec.set()) {
+              if crate::db::RetiredTributaryDb::get(&raw_db, spec.set().encode()).is_some() {
                 break;
               }
 
