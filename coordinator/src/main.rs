@@ -37,7 +37,7 @@ use ::tributary::{
 
 mod tributary;
 use crate::tributary::{
-  TributarySpec, SignData, Transaction, TributaryDb, NonceDecider, scanner::RecognizedIdType,
+  TributarySpec, SignData, Transaction, NonceDecider, scanner::RecognizedIdType, PlanIdsDb,
 };
 
 mod db;
@@ -238,8 +238,9 @@ async fn handle_processor_message<D: Db, P: P2p>(
             .iter()
             .filter_map(|plan| Some(plan.id).filter(|_| plan.key == key))
             .collect::<Vec<_>>();
-          TributaryDb::<D>::set_plan_ids(&mut txn, tributary.spec.genesis(), *block, &plans);
-
+          let gen_slice: &[u8] = &tributary.spec.genesis();
+          let key = [gen_slice, &block.to_le_bytes().as_ref()].concat();
+          PlanIdsDb::set(&mut txn, key, &plans.concat());
           let tx = Transaction::SubstrateBlock(*block);
           log::trace!("processor message effected transaction {}", hex::encode(tx.hash()));
           log::trace!("providing transaction {}", hex::encode(tx.hash()));

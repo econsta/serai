@@ -1,6 +1,7 @@
 use core::{ops::Deref, future::Future};
 use std::collections::HashMap;
-
+use std::io::Read;
+use scale::Encode;
 use zeroize::Zeroizing;
 
 use ciphersuite::{group::GroupEncoding, Ciphersuite, Ristretto};
@@ -26,12 +27,15 @@ use serai_db::{Get, Db};
 use crate::{
   processors::Processors,
   tributary::{
-    Transaction, TributarySpec, Topic, DataSpecification, TributaryDb,
+    Transaction, TributarySpec, Topic, DataSpecification,
+    FatallySlashedDb,
     nonce_decider::NonceDecider,
     dkg_confirmer::DkgConfirmer,
-    scanner::{RecognizedIdType, RIDTrait},
+    scanner::{RecognizedIdType, RIDTrait}, DataDb,
   },
 };
+
+use super::{PlanIdsDb, CurrentlyCompletingKeyPairDb, KeyPairDb, AttemptDb, DataReceivedDb};
 
 const DKG_COMMITMENTS: &str = "commitments";
 const DKG_SHARES: &str = "shares";
@@ -46,7 +50,7 @@ const BATCH_SHARE: &str = "b_share";
 const SIGN_PREPROCESS: &str = "s_preprocess";
 const SIGN_SHARE: &str = "s_share";
 
-fn read_known_to_exist_data<D: Db, G: Get>(
+fn read_known_to_exist_data<G: Get>(
   getter: &G,
   spec: &TributarySpec,
   key: &Zeroizing<<Ristretto as Ciphersuite>::F>,
@@ -55,14 +59,10 @@ fn read_known_to_exist_data<D: Db, G: Get>(
 ) -> Option<HashMap<Participant, Vec<u8>>> {
   let mut data = HashMap::new();
   for validator in spec.validators().iter().map(|validator| validator.0) {
-    data.insert(
-      spec.i(validator).unwrap(),
-      if let Some(data) = TributaryDb::<D>::data(getter, spec.genesis(), data_spec, validator) {
-        data
-      } else {
-        continue;
-      },
-    );
+    let key = [data_spec.as_key(spec.genesis()).as_slice(), validator.to_bytes().as_ref()].concat();
+    if let Some(bytes) = DataDb::get(getter, key) {
+      data.insert(spec.i(validator).unwrap(), bytes);
+    };
   }
   assert_eq!(data.len(), usize::from(needed));
 
@@ -97,9 +97,9 @@ pub fn generated_key_pair<D: Db>(
   key_pair: &KeyPair,
   attempt: u32,
 ) -> Result<[u8; 32], Participant> {
-  TributaryDb::<D>::save_currently_completing_key_pair(txn, spec.genesis(), key_pair);
+  CurrentlyCompletingKeyPairDb::set(txn, spec.genesis(), key_pair);
 
-  let Some(preprocesses) = read_known_to_exist_data::<D, _>(
+  let Some(preprocesses) = read_known_to_exist_data::<_>(
     txn,
     spec,
     key,
@@ -118,7 +118,7 @@ pub(crate) fn fatal_slash<D: Db>(
   reason: &str,
 ) {
   log::warn!("fatally slashing {}. reason: {}", hex::encode(account), reason);
-  TributaryDb::<D>::set_fatally_slashed(txn, genesis, account);
+  FatallySlashedDb::set_fatally_slashed(txn, genesis, account);
   // TODO: disconnect the node from network/ban from further participation in all Tributaries
 }
 
@@ -144,7 +144,7 @@ pub(crate) async fn handle_application_tx<
                 data_spec: &DataSpecification,
                 bytes: Vec<u8>,
                 signed: &Signed| {
-    let Some(curr_attempt) = TributaryDb::<D>::attempt(txn, genesis, data_spec.topic) else {
+    let Some(curr_attempt) = AttemptDb::attempt(txn, genesis, data_spec.topic) else {
       // Premature publication of a valid ID/publication of an invalid ID
       fatal_slash::<D>(
         txn,
@@ -156,7 +156,8 @@ pub(crate) async fn handle_application_tx<
     };
 
     // If they've already published a TX for this attempt, slash
-    if TributaryDb::<D>::data(txn, genesis, data_spec, signed.signer).is_some() {
+    let data_key = [data_spec.as_key(genesis).as_slice(), signed.signer.to_bytes().as_ref()].concat();
+    if DataDb::get(txn, data_key).is_some() {
       fatal_slash::<D>(txn, genesis, signed.signer.to_bytes(), "published data multiple times");
       return None;
     }
@@ -183,13 +184,21 @@ pub(crate) async fn handle_application_tx<
     // TODO: If this is shares, we need to check they are part of the selected signing set
 
     // Store this data
-    let received = TributaryDb::<D>::set_data(txn, genesis, data_spec, signed.signer, &bytes);
+    let recvd_key = data_spec.as_key(genesis);
+    let mut received = DataReceivedDb::get(txn, &recvd_key)
+      .and_then(|bytes| bytes.try_into().ok())
+      .map(u16::from_le_bytes)
+      .unwrap_or(0);
+    received += 1;
+    DataReceivedDb::set(txn, recvd_key, &received.to_le_bytes());
+    let data_key = [data_spec.as_key(genesis).as_slice(), signed.signer.to_bytes().as_ref()].concat();
+    DataDb::set(txn, data_key, &bytes);
 
     // If we have all the needed commitments/preprocesses/shares, tell the processor
     // TODO: This needs to be coded by weight, not by validator count
     let needed = if data_spec.topic == Topic::Dkg { spec.n() } else { spec.t() };
     if received == needed {
-      return Some(read_known_to_exist_data::<D, _>(txn, spec, key, data_spec, needed));
+      return Some(read_known_to_exist_data::<_>(txn, spec, key, data_spec, needed));
     }
     None
   };
@@ -285,23 +294,15 @@ pub(crate) async fn handle_application_tx<
         Some(Some(shares)) => {
           log::info!("got all DkgConfirmed for {}", hex::encode(genesis));
 
-          let Some(preprocesses) = read_known_to_exist_data::<D, _>(
+          let preprocesses = read_known_to_exist_data::<_>(
             txn,
             spec,
             key,
             &DataSpecification { topic: Topic::Dkg, label: DKG_CONFIRMATION_NONCES, attempt },
             spec.n(),
-          ) else {
-            panic!("wasn't a participant in DKG confirmation nonces");
-          };
-
-          let key_pair = TributaryDb::<D>::currently_completing_key_pair(txn, genesis)
-            .unwrap_or_else(|| {
-              panic!(
-                "in DkgConfirmed handling, which happens after everyone {}",
-                "(including us) fires DkgConfirmed, yet no confirming key pair"
-              )
-            });
+          ).expect("wasn't a participant in DKG confirmation nonces");
+          let key_pair = CurrentlyCompletingKeyPairDb::get(txn, genesis)
+            .expect("in DkgConfirmed handling, which happens after everyone (including us) fires DkgConfirmed, yet no confirming key pair");
           let Ok(sig) = DkgConfirmer::complete(spec, key, attempt, preprocesses, &key_pair, shares)
           else {
             // TODO: Full slash
@@ -321,20 +322,31 @@ pub(crate) async fn handle_application_tx<
 
     Transaction::Batch(_, batch) => {
       // Because this Batch has achieved synchrony, its batch ID should be authorized
-      TributaryDb::<D>::recognize_topic(txn, genesis, Topic::Batch(batch));
+      AttemptDb::set(txn, Topic::Batch(batch).as_key(genesis), &0u32.to_le_bytes());
       let nonce = NonceDecider::<D>::handle_batch(txn, genesis, batch);
       recognized_id(spec.set(), genesis, RecognizedIdType::Batch, batch, nonce).await;
     }
 
     Transaction::SubstrateBlock(block) => {
-      let plan_ids = TributaryDb::<D>::plan_ids(txn, genesis, block).expect(
+      let gen_slice: &[u8] = genesis.as_ref();
+      let key = [gen_slice, &block.to_le_bytes().as_ref()].concat();
+      let plan_ids = PlanIdsDb::get(txn, key).map(|bytes| {
+        let mut res = vec![];
+        let mut bytes_ref = bytes.as_slice();
+        while !bytes_ref.is_empty() {
+          let mut id = [0; 32];
+          bytes_ref.read_exact(&mut id).unwrap();
+          res.push(id);
+        }
+        res
+      }).expect(
         "synced a tributary block finalizing a substrate block in a provided transaction \
           despite us not providing that transaction",
       );
 
       let nonces = NonceDecider::<D>::handle_substrate_block(txn, genesis, &plan_ids);
       for (nonce, id) in nonces.into_iter().zip(plan_ids.into_iter()) {
-        TributaryDb::<D>::recognize_topic(txn, genesis, Topic::Sign(id));
+        AttemptDb::set(txn, Topic::Sign(id).as_key(genesis), &0u32.to_le_bytes());
         recognized_id(spec.set(), genesis, RecognizedIdType::Plan, id, nonce).await;
       }
     }
@@ -352,7 +364,7 @@ pub(crate) async fn handle_application_tx<
       ) {
         Some(Some(preprocesses)) => {
           NonceDecider::<D>::selected_for_signing_batch(txn, genesis, data.plan);
-          let key = TributaryDb::<D>::key_pair(txn, spec.set()).unwrap().0 .0.to_vec();
+          let key = KeyPairDb::get(txn, spec.set().encode()).unwrap().0 .0.to_vec();
           processors
             .send(
               spec.set().network,
@@ -379,7 +391,7 @@ pub(crate) async fn handle_application_tx<
         &data.signed,
       ) {
         Some(Some(shares)) => {
-          let key = TributaryDb::<D>::key_pair(txn, spec.set()).unwrap().0 .0.to_vec();
+          let key = KeyPairDb::get(txn, spec.set().encode()).unwrap().0 .0.to_vec();
           processors
             .send(
               spec.set().network,
@@ -399,7 +411,7 @@ pub(crate) async fn handle_application_tx<
     }
 
     Transaction::SignPreprocess(data) => {
-      let key_pair = TributaryDb::<D>::key_pair(txn, spec.set());
+      let key_pair = KeyPairDb::get(txn, spec.set().encode());
       match handle(
         txn,
         &DataSpecification {
@@ -434,7 +446,7 @@ pub(crate) async fn handle_application_tx<
       }
     }
     Transaction::SignShare(data) => {
-      let key_pair = TributaryDb::<D>::key_pair(txn, spec.set());
+      let key_pair = KeyPairDb::get(txn, spec.set().encode());
       match handle(
         txn,
         &DataSpecification {
@@ -475,7 +487,7 @@ pub(crate) async fn handle_application_tx<
       );
       // TODO: Confirm this is a valid plan ID
       // TODO: Confirm this signer hasn't prior published a completion
-      let Some(key_pair) = TributaryDb::<D>::key_pair(txn, spec.set()) else { todo!() };
+      let Some(key_pair) = KeyPairDb::get(txn, spec.set().encode()) else { todo!() };
       processors
         .send(
           spec.set().network,
