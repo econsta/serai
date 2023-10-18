@@ -17,19 +17,19 @@ use crate::tributary::{TributarySpec, Transaction, scanner::RecognizedIdType};
 
 create_db!(
   MainDb {
-    HandledMessageDb: Vec<u8>,
-    InTributaryDb: Vec<u8>,
-    ActiveTributaryDb: Vec<u8>,
-    RetiredTributaryDb: Vec<u8>,
-    SignedTransactionDb: Vec<u8>,
-    FirstPreprocessDb: Vec<u8>,
-    LastRecievedBatchDb: u32,
-    ExpectedBatchDb: [u8; 32],
-    BatchDb: SignedBatch,
-    LastVerifiedBatchDb: u32,
-    HandoverBatchDb: u32,
-    LookupHandoverBatchDb: Session,
-    QueuedBatchesDb: Vec<u8>
+    HandledMessageDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    InTributaryDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    ActiveTributaryDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    RetiredTributaryDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    SignedTransactionDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    FirstPreprocessDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    LastRecievedBatchDb: (key: impl AsRef<[u8]>) -> u32,
+    ExpectedBatchDb: (key: impl AsRef<[u8]>) -> [u8; 32],
+    BatchDb: (key: impl AsRef<[u8]>) -> SignedBatch,
+    LastVerifiedBatchDb: (key: impl AsRef<[u8]>) -> u32,
+    HandoverBatchDb: (key: impl AsRef<[u8]>) -> u32,
+    LookupHandoverBatchDb: (key: impl AsRef<[u8]>) -> Session,
+    QueuedBatchesDb: (key: impl AsRef<[u8]>) -> Vec<u8>
   }
 );
 

@@ -29,10 +29,10 @@ pub struct KeyConfirmed<C: Ciphersuite> {
 
 create_db!(
   KeyGenDb {
-    ParamsDb: ThresholdParams,
-    CommitmentsDb: HashMap<Participant, Vec<u8>>,
-    GeneratedKeysDb: Vec<u8>,
-    KeysDb: Vec<u8>
+    ParamsDb: (key: &ValidatorSet) -> ThresholdParams,
+    CommitmentsDb: (key: &KeyGenId) -> HashMap<Participant, Vec<u8>>,
+    GeneratedKeysDb: (set: &ValidatorSet, key_one: &[u8; 32], key_two: &[u8]) -> Vec<u8>,
+    KeysDb: (key: &Vec<u8>) -> Vec<u8>
   }
 );
 
@@ -56,7 +56,7 @@ fn confirm_keys<N: Network>(
 ) -> (ThresholdKeys<Ristretto>, ThresholdKeys<N::Curve>) {
   let val: &[u8] = key_pair.1.as_ref();
   let (keys_vec, keys) =
-    read_keys::<N>(txn, &GeneratedKeysDb::key((set, (&key_pair.0 .0, val)).encode())).unwrap();
+    read_keys::<N>(txn, &GeneratedKeysDb::key(&set, &key_pair.0 .0, val)).unwrap();
   assert_eq!(key_pair.0 .0, keys.0.group_key().to_bytes());
   assert_eq!(
     {
@@ -65,7 +65,7 @@ fn confirm_keys<N: Network>(
     },
     keys.1.group_key().to_bytes().as_ref(),
   );
-  txn.put(KeysDb::key(keys.1.group_key().to_bytes()), keys_vec);
+  txn.put(KeysDb::key(&keys.1.group_key().to_bytes().as_ref().into()), keys_vec);
   keys
 }
 
@@ -73,7 +73,7 @@ fn keys<N: Network>(
   getter: &impl Get,
   key: &<N::Curve as Ciphersuite>::G,
 ) -> Option<(ThresholdKeys<Ristretto>, ThresholdKeys<N::Curve>)> {
-  let res = read_keys::<N>(getter, &KeysDb::key(key.to_bytes()))?.1;
+  let res = read_keys::<N>(getter, &KeysDb::key(&key.to_bytes().as_ref().into()))?.1;
   assert_eq!(&res.1.group_key(), key);
   Some(res)
 }
@@ -86,12 +86,7 @@ impl GeneratedKeysDb {
   ) {
     let mut keys = substrate_keys.serialize();
     keys.extend(network_keys.serialize().iter());
-    let key = (
-      id.set,
-      (&substrate_keys.group_key().to_bytes(), network_keys.group_key().to_bytes().as_ref()),
-    )
-      .encode();
-    txn.put(Self::key(key), keys);
+    txn.put(Self::key(&id.set, &substrate_keys.group_key().to_bytes(), network_keys.group_key().to_bytes().as_ref()), keys);
   }
 }
 
@@ -116,7 +111,7 @@ impl<N: Network, D: Db> KeyGen<N, D> {
 
   pub fn in_set(&self, set: &ValidatorSet) -> bool {
     // We determine if we're in set using if we have the parameters for a set's key generation
-    ParamsDb::get(&self.db, set.encode()).is_some()
+    ParamsDb::get(&self.db, set).is_some()
   }
 
   pub fn keys(
@@ -174,7 +169,7 @@ impl<N: Network, D: Db> KeyGen<N, D> {
           self.active_share.remove(&id.set).is_none()
         {
           // If we haven't handled this set before, save the params
-          ParamsDb::set(txn, &id.set.encode(), &params);
+          ParamsDb::set(txn, &id.set, &params);
         }
 
         let (machines, commitments) = key_gen_machines(id, params);
@@ -195,7 +190,7 @@ impl<N: Network, D: Db> KeyGen<N, D> {
           panic!("commitments when already handled commitments");
         }
 
-        let params = ParamsDb::get(txn, id.set.encode()).unwrap();
+        let params = ParamsDb::get(txn, &id.set).unwrap();
 
         // Unwrap the machines, rebuilding them if we didn't have them in our cache
         // We won't if the processor rebooted
@@ -255,7 +250,7 @@ impl<N: Network, D: Db> KeyGen<N, D> {
           share.extend(network_shares[i].serialize());
         }
 
-        CommitmentsDb::set(txn, &id.encode(), &commitments);
+        CommitmentsDb::set(txn, &id, &commitments);
 
         ProcessorMessage::Shares { id, shares }
       }
@@ -263,13 +258,13 @@ impl<N: Network, D: Db> KeyGen<N, D> {
       CoordinatorMessage::Shares { id, shares } => {
         info!("Received shares for {:?}", id);
 
-        let params = ParamsDb::get(txn, id.set.encode()).unwrap();
+        let params = ParamsDb::get(txn, &id.set).unwrap();
 
         // Same commentary on inconsistency as above exists
         let machines = self.active_share.remove(&id.set).unwrap_or_else(|| {
           let machines = key_gen_machines(id, params).0;
           let mut rng = secret_shares_rng(id);
-          let commitments = CommitmentsDb::get(txn, id.encode()).unwrap();
+          let commitments = CommitmentsDb::get(txn, &id).unwrap();
 
           let mut commitments_ref: HashMap<Participant, &[u8]> =
             commitments.iter().map(|(i, commitments)| (*i, commitments.as_ref())).collect();

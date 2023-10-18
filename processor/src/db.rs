@@ -8,8 +8,8 @@ use crate::networks::{Block, Network};
 
 create_db!(
   MainDb {
-    HandledMessageDb: Vec<u8>,
-    PendingActivationsDb: Vec<u8>
+    HandledMessageDb: (key: impl AsRef<[u8]>) -> Vec<u8>,
+    PendingActivationsDb: (key: impl AsRef<[u8]>) -> Vec<u8>
   }
 );
 

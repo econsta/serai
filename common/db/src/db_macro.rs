@@ -1,7 +1,7 @@
 #[macro_export]
 macro_rules! create_db {
   ($db_name: ident
-    { $($field_name: ident: $field_type: ty),*}
+    { $($field_name: ident: ($($arg: ident: $arg_type: ty),*) -> $field_type: ty),*}
   ) => {
     fn db_key(db_dst: &'static [u8], item_dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
       let db_len = u8::try_from(db_dst.len()).unwrap();
@@ -13,17 +13,17 @@ macro_rules! create_db {
       #[derive(Clone, Debug)]
       pub struct $field_name;
       impl $field_name {
-        pub fn key(key: impl AsRef<[u8]>) -> Vec<u8> {
-          db_key(stringify!($db_name).as_bytes(), stringify!($field_name).as_bytes(), key)
+        pub fn key($($arg: $arg_type),*) -> Vec<u8> {
+          db_key(stringify!($db_name).as_bytes(), stringify!($field_name).as_bytes(), (vec![] as Vec<u8>, $($arg),*).encode())
         }
         #[allow(dead_code)]
-        pub fn set(txn: &mut impl DbTxn, key: impl AsRef<[u8]>, data: &impl serde::Serialize) {
-          let key = $field_name::key(key);
+        pub fn set(txn: &mut impl DbTxn $(, $arg: $arg_type)*,  data: &impl serde::Serialize) {
+          let key = $field_name::key($($arg),*);
           txn.put(&key, bincode::serialize(data).unwrap());
         }
         #[allow(dead_code)]
-        pub fn get(getter: &impl Get, key: impl AsRef<[u8]>) -> Option<$field_type> {
-          getter.get($field_name::key(key)).map(|data| {
+        pub fn get(getter: &impl Get, $($arg: $arg_type),*) -> Option<$field_type> {
+          getter.get($field_name::key($($arg),*)).map(|data| {
             bincode::deserialize(data.as_ref()).unwrap()
           })
         }
