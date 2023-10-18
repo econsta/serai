@@ -36,9 +36,10 @@ use ::tributary::{
 };
 
 mod tributary;
-use crate::{tributary::{
-  TributarySpec, SignData, Transaction, TributaryDb, NonceDecider, scanner::RecognizedIdType,
-}, db::InTributaryDb};
+use crate::tributary::{
+  TributarySpec, SignData, Transaction, NonceDecider, scanner::RecognizedIdType, PlanIdsDb,
+};
+use crate::db::InTributaryDb;
 
 mod db;
 use db::*;
@@ -221,7 +222,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
           let session = SubstrateDb::<D>::session_for_key(&txn, &key).unwrap();
           // Only keep them if we're in the Tributary AND they haven't been retied
           let set = ValidatorSet { network: *network, session };
-          if InTributaryDb::get(&txn, set.encode()).is_some() && (!RetiredTributaryDb::get(&txn, set.encode()).is_some())
+          if InTributaryDb::get(&txn, set.encode()).is_some() && RetiredTributaryDb::get(&txn, set.encode()).is_none()
           {
             sessions.push((session, key));
           }
@@ -240,8 +241,9 @@ async fn handle_processor_message<D: Db, P: P2p>(
             .iter()
             .filter_map(|plan| Some(plan.id).filter(|_| plan.key == key))
             .collect::<Vec<_>>();
-          TributaryDb::<D>::set_plan_ids(&mut txn, tributary.spec.genesis(), *block, &plans);
-
+          let gen_slice: &[u8] = &tributary.spec.genesis();
+          let key = [gen_slice, &block.to_le_bytes().as_ref()].concat();
+          PlanIdsDb::set(&mut txn, key, &plans.concat());
           let tx = Transaction::SubstrateBlock(*block);
           log::trace!("processor message effected transaction {}", hex::encode(tx.hash()));
           log::trace!("providing transaction {}", hex::encode(tx.hash()));

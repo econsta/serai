@@ -35,7 +35,7 @@ create_db!(
 
 impl ActiveTributaryDb {
   pub fn active_tributaries<G: Get>(getter: &G) -> (Vec<u8>, Vec<TributarySpec>) {
-    let bytes = getter.get(Self::key(&[])).unwrap_or(vec![]);
+    let bytes = getter.get(Self::key([])).unwrap_or_default();
     let mut bytes_ref: &[u8] = bytes.as_ref();
 
     let mut tributaries = vec![];
@@ -59,7 +59,7 @@ impl ActiveTributaryDb {
     for active in active {
       active.write(&mut bytes).unwrap();
     }
-    txn.put(Self::key(&[]), bytes);
+    txn.put(Self::key([]), bytes);
     txn.put(RetiredTributaryDb::key(set.encode()), []);
   }
 }
@@ -125,13 +125,13 @@ impl HandoverBatchDb {
 impl QueuedBatchesDb {
   pub fn queue_batch(txn: &mut impl DbTxn, set: ValidatorSet, batch: Transaction) {
     let key = Self::key(set.encode());
-    let mut batches = txn.get(&key).unwrap_or(vec![]);
+    let mut batches = txn.get(&key).unwrap_or_default();
     batches.extend(batch.serialize());
     txn.put(&key, batches);
   }
   pub fn take_queued_batches(txn: &mut impl DbTxn, set: ValidatorSet) -> Vec<Transaction> {
     let key = Self::key(set.encode());
-    let batches_vec = txn.get(&key).unwrap_or(vec![]);
+    let batches_vec = txn.get(&key).unwrap_or_default();
     txn.del(&key);
     let mut batches: &[u8] = &batches_vec;
 

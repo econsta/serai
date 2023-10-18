@@ -24,7 +24,7 @@ use crate::{
   Db,
   tributary::handle::{fatal_slash, handle_application_tx},
   processors::Processors,
-  tributary::{TributaryDb, TributarySpec, Transaction},
+  tributary::{LastBlockDb, TributarySpec, Transaction, EventDb},
   P2p,
 };
 
@@ -53,7 +53,7 @@ async fn handle_block<
   RID: RIDTrait<FRid>,
   P: P2p,
 >(
-  db: &mut TributaryDb<D>,
+  db: &mut D,
   key: &Zeroizing<<Ristretto as Ciphersuite>::F>,
   recognized_id: RID,
   processors: &Pro,
@@ -66,15 +66,16 @@ async fn handle_block<
   let genesis = spec.genesis();
   let hash = block.hash();
 
-  let mut event_id = 0;
+  let mut event_id = 0u32;
   #[allow(clippy::explicit_counter_loop)] // event_id isn't TX index. It just currently lines up
   for tx in block.transactions {
-    if TributaryDb::<D>::handled_event(&db.0, hash, event_id) {
+    let event_key = [hash.as_slice(), &event_id.to_le_bytes()].concat();
+    if EventDb::get(db, &event_key).is_some() {
       event_id += 1;
       continue;
     }
 
-    let mut txn = db.0.txn();
+    let mut txn = db.txn();
 
     match tx {
       TributaryTransaction::Tendermint(TendermintTx::SlashEvidence(ev)) => {
@@ -104,8 +105,8 @@ async fn handle_block<
         .await;
       }
     }
-
-    TributaryDb::<D>::handle_event(&mut txn, hash, event_id);
+    let event_key = [hash.as_slice(), &event_id.to_le_bytes()].concat();
+    EventDb::set(&mut txn, event_key, &[] as &[u8; 0]);
     txn.commit();
 
     event_id += 1;
@@ -123,7 +124,7 @@ pub(crate) async fn handle_new_blocks<
   RID: RIDTrait<FRid>,
   P: P2p,
 >(
-  db: &mut TributaryDb<D>,
+  db: &mut D,
   key: &Zeroizing<<Ristretto as Ciphersuite>::F>,
   recognized_id: RID,
   processors: &Pro,
@@ -132,7 +133,7 @@ pub(crate) async fn handle_new_blocks<
   tributary: &TributaryReader<D, Transaction>,
 ) {
   let genesis = tributary.genesis();
-  let mut last_block = db.last_block(genesis);
+  let mut last_block = LastBlockDb::get(db, genesis).unwrap_or(genesis);
   while let Some(next) = tributary.block_after(&last_block) {
     let block = tributary.block(&next).unwrap();
 
@@ -160,7 +161,9 @@ pub(crate) async fn handle_new_blocks<
     )
     .await;
     last_block = next;
-    db.set_last_block(genesis, next);
+    let mut txn = db.txn();
+    LastBlockDb::set(&mut txn, genesis, &next);
+    txn.commit();
   }
 }
 
@@ -185,7 +188,7 @@ pub(crate) async fn scan_tributaries_task<
       Ok(crate::TributaryEvent::NewTributary(crate::ActiveTributary { spec, tributary })) => {
         // For each Tributary, spawn a dedicated scanner task
         tokio::spawn({
-          let raw_db = raw_db.clone();
+          let mut raw_db = raw_db.clone();
           let key = key.clone();
           let recognized_id = recognized_id.clone();
           let processors = processors.clone();
@@ -193,7 +196,6 @@ pub(crate) async fn scan_tributaries_task<
           async move {
             let spec = &spec;
             let reader = tributary.reader();
-            let mut tributary_db = TributaryDb::new(raw_db.clone());
             loop {
               // Check if the set was retired, and if so, don't further operate
               if crate::db::RetiredTributaryDb::get(&raw_db, spec.set().encode()).is_some() {
@@ -205,7 +207,7 @@ pub(crate) async fn scan_tributaries_task<
               let next_block_notification = tributary.next_block_notification().await;
 
               handle_new_blocks::<_, _, _, _, _, _, P>(
-                &mut tributary_db,
+                &mut raw_db,
                 &key,
                 recognized_id.clone(),
                 &processors,
