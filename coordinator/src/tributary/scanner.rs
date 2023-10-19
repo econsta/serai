@@ -24,7 +24,7 @@ use crate::{
   Db,
   tributary::handle::{fatal_slash, handle_application_tx},
   processors::Processors,
-  tributary::{LastBlockDb, TributarySpec, Transaction, EventDb},
+  tributary::{LastBlockDb, TributarySpec, Transaction, TributaryEventDb},
   P2p,
 };
 
@@ -70,7 +70,7 @@ async fn handle_block<
   #[allow(clippy::explicit_counter_loop)] // event_id isn't TX index. It just currently lines up
   for tx in block.transactions {
     let event_key = [hash.as_slice(), &event_id.to_le_bytes()].concat();
-    if EventDb::get(db, event_key).is_some() {
+    if TributaryEventDb::get(db, event_key).is_some() {
       event_id += 1;
       continue;
     }
@@ -106,7 +106,7 @@ async fn handle_block<
       }
     }
     let event_key = [hash.as_slice(), &event_id.to_le_bytes()].concat();
-    EventDb::set(&mut txn, event_key, &[] as &[u8; 0]);
+    TributaryEventDb::set(&mut txn, event_key, &[] as &[u8; 0]);
     txn.commit();
 
     event_id += 1;

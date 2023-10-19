@@ -57,7 +57,7 @@ create_db!(
     AttemptDb: (key: Vec<u8>) -> Vec<u8>,
     DataReceivedDb: (key: &Vec<u8>) -> Vec<u8>,
     DataDb: (spec: Vec<u8>, signer: [u8; 32]) -> Vec<u8>,
-    EventDb: (key: Vec<u8>) -> Vec<u8>
+    TributaryEventDb: (key: Vec<u8>) -> Vec<u8>
   }
 );
 

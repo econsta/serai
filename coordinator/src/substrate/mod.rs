@@ -137,7 +137,7 @@ async fn handle_key_gen<D: Db, Pro: Processors>(
 ) -> Result<(), SeraiError> {
   // This has to be saved *before* we send ConfirmKeyPair
   let mut txn = db.txn();
-  SubstrateDb::<D>::save_session_for_keys(&mut txn, &key_pair, set.session);
+  SessionDb::save_session_for_keys(&mut txn, &key_pair, set.session);
   txn.commit();
 
   processors
@@ -196,7 +196,7 @@ async fn handle_batch_and_burns<D: Db, Pro: Processors>(
       network_had_event(&mut burns, &mut batches, network);
 
       let mut txn = db.txn();
-      SubstrateDb::<D>::save_batch_instructions_hash(&mut txn, network, id, instructions_hash);
+      BatchInstructionDb:: set(&mut txn, network, id, &instructions_hash);
       txn.commit();
 
       // Make sure this is the only Batch event for this network in this Block
@@ -258,7 +258,7 @@ async fn handle_batch_and_burns<D: Db, Pro: Processors>(
 // Handle a specific Substrate block, returning an error when it fails to get data
 // (not blocking / holding)
 async fn handle_block<D: Db, Pro: Processors>(
-  db: &mut SubstrateDb<D>,
+  db: &mut D,
   key: &Zeroizing<<Ristretto as Ciphersuite>::F>,
   new_tributary_spec: &mpsc::UnboundedSender<TributarySpec>,
   tributary_retired: &mpsc::UnboundedSender<ValidatorSet>,
@@ -287,11 +287,11 @@ async fn handle_block<D: Db, Pro: Processors>(
       continue;
     }
 
-    if !SubstrateDb::<D>::handled_event(&db.0, hash, event_id) {
+    if SubstrateEventDb::get(db, hash, event_id).is_none() {
       log::info!("found fresh new set event {:?}", new_set);
-      let mut txn = db.0.txn();
+      let mut txn = db.txn();
       handle_new_set::<D>(&mut txn, key, new_tributary_spec, serai, &block, set).await?;
-      SubstrateDb::<D>::handle_event(&mut txn, hash, event_id);
+      SubstrateEventDb::handle_event(&mut txn, hash, event_id);
       txn.commit();
     }
     event_id += 1;
@@ -299,21 +299,21 @@ async fn handle_block<D: Db, Pro: Processors>(
 
   // If a key pair was confirmed, inform the processor
   for key_gen in serai.as_of(hash).validator_sets().key_gen_events().await? {
-    if !SubstrateDb::<D>::handled_event(&db.0, hash, event_id) {
+    if SubstrateEventDb::get(db, hash, event_id).is_none() {
       log::info!("found fresh key gen event {:?}", key_gen);
       if let ValidatorSetsEvent::KeyGen { set, key_pair } = key_gen {
         // Immediately ensure this key pair is accessible to the tributary, before we fire any
         // events off of it
-        let mut txn = db.0.txn();
+        let mut txn = db.txn();
         KeyPairDb::set(&mut txn, set, &key_pair);
         txn.commit();
 
-        handle_key_gen(&mut db.0, processors, serai, &block, set, key_pair).await?;
+        handle_key_gen(db, processors, serai, &block, set, key_pair).await?;
       } else {
         panic!("KeyGen event wasn't KeyGen: {key_gen:?}");
       }
-      let mut txn = db.0.txn();
-      SubstrateDb::<D>::handle_event(&mut txn, hash, event_id);
+      let mut txn = db.txn();
+      SubstrateEventDb::handle_event(&mut txn, hash, event_id);
       txn.commit();
     }
     event_id += 1;
@@ -328,12 +328,12 @@ async fn handle_block<D: Db, Pro: Processors>(
       continue;
     }
 
-    if !SubstrateDb::<D>::handled_event(&db.0, hash, event_id) {
+    if SubstrateEventDb::get(db, hash, event_id).is_none() {
       log::info!("found fresh set retired event {:?}", retired_set);
-      let mut txn = db.0.txn();
+      let mut txn = db.txn();
       crate::db::ActiveTributaryDb::retire_tributary(&mut txn, set);
       tributary_retired.send(set).unwrap();
-      SubstrateDb::<D>::handle_event(&mut txn, hash, event_id);
+      SubstrateEventDb::handle_event(&mut txn, hash, event_id);
       txn.commit();
     }
     event_id += 1;
@@ -344,18 +344,18 @@ async fn handle_block<D: Db, Pro: Processors>(
   // following events share data collection
   // This does break the uniqueness of (hash, event_id) -> one event, yet
   // (network, (hash, event_id)) remains valid as a unique ID for an event
-  if !SubstrateDb::<D>::handled_event(&db.0, hash, event_id) {
-    handle_batch_and_burns(&mut db.0, processors, serai, &block).await?;
+  if SubstrateEventDb::get(db, hash, event_id).is_none() {
+    handle_batch_and_burns(db, processors, serai, &block).await?;
   }
-  let mut txn = db.0.txn();
-  SubstrateDb::<D>::handle_event(&mut txn, hash, event_id);
+  let mut txn = db.txn();
+  SubstrateEventDb::handle_event(&mut txn, hash, event_id);
   txn.commit();
 
   Ok(())
 }
 
 async fn handle_new_blocks<D: Db, Pro: Processors>(
-  db: &mut SubstrateDb<D>,
+  db: &mut D,
   key: &Zeroizing<<Ristretto as Ciphersuite>::F>,
   new_tributary_spec: &mpsc::UnboundedSender<TributarySpec>,
   tributary_retired: &mpsc::UnboundedSender<ValidatorSet>,
@@ -391,7 +391,9 @@ async fn handle_new_blocks<D: Db, Pro: Processors>(
     )
     .await?;
     *next_block += 1;
-    db.set_next_block(*next_block);
+    let mut txn = db.txn();
+    BlockDb::set(&mut txn, next_block);
+    txn.commit();
     log::info!("handled substrate block {b}");
   }
 
@@ -399,7 +401,7 @@ async fn handle_new_blocks<D: Db, Pro: Processors>(
 }
 
 pub async fn scan_task<D: Db, Pro: Processors>(
-  db: D,
+  mut db: D,
   key: Zeroizing<<Ristretto as Ciphersuite>::F>,
   processors: Pro,
   serai: Arc<Serai>,
@@ -408,8 +410,7 @@ pub async fn scan_task<D: Db, Pro: Processors>(
 ) {
   log::info!("scanning substrate");
 
-  let mut db = SubstrateDb::new(db);
-  let mut next_substrate_block = db.next_block();
+  let mut next_substrate_block = BlockDb::get(&db).unwrap();
 
   let new_substrate_block_notifier = {
     let serai = &serai;
@@ -503,7 +504,7 @@ pub(crate) async fn verify_published_batches<D: Db>(
   // TODO: Localize from MainDb to SubstrateDb
   let last = crate::LastVerifiedBatchDb::get(txn, network);
   for id in last.map(|last| last + 1).unwrap_or(0) ..= optimistic_up_to {
-    let Some(on_chain) = SubstrateDb::<D>::batch_instructions_hash(txn, network, id) else {
+    let Some(on_chain) = BatchInstructionDb::get(txn, network, id) else {
       break;
     };
     let off_chain = ExpectedBatchDb::get(txn, network, id).unwrap();

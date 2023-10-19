@@ -5,6 +5,7 @@ use std::{
   collections::{VecDeque, HashSet, HashMap},
 };
 
+use substrate::SessionDb;
 use zeroize::{Zeroize, Zeroizing};
 use rand_core::OsRng;
 
@@ -52,7 +53,6 @@ pub mod processors;
 use processors::Processors;
 
 mod substrate;
-use substrate::SubstrateDb;
 
 #[cfg(test)]
 pub mod tests;
@@ -191,16 +191,16 @@ async fn handle_processor_message<D: Db, P: P2p>(
     ProcessorMessage::Sign(inner_msg) => match inner_msg {
       // We'll only receive Preprocess and Share if we're actively signing
       sign::ProcessorMessage::Preprocess { id, .. } => {
-        Some(SubstrateDb::<D>::session_for_key(&txn, &id.key).unwrap())
+        SessionDb::get(&txn, &id.key)
       }
       sign::ProcessorMessage::Share { id, .. } => {
-        Some(SubstrateDb::<D>::session_for_key(&txn, &id.key).unwrap())
+        SessionDb::get(&txn, &id.key)
       }
       // While the Processor's Scanner will always emit Completed, that's routed through the
       // Signer and only becomes a ProcessorMessage::Completed if the Signer is present and
       // confirms it
       sign::ProcessorMessage::Completed { key, .. } => {
-        Some(SubstrateDb::<D>::session_for_key(&txn, key).unwrap())
+        SessionDb::get(&txn, key)
       }
     },
     ProcessorMessage::Coordinator(inner_msg) => match inner_msg {
@@ -216,7 +216,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
         let keys = plans.iter().map(|plan| plan.key.clone()).collect::<HashSet<_>>();
         let mut sessions = vec![];
         for key in keys {
-          let session = SubstrateDb::<D>::session_for_key(&txn, &key).unwrap();
+          let session = SessionDb::get(&txn, &key).unwrap();
           // Only keep them if we're in the Tributary AND they haven't been retied
           let set = ValidatorSet { network: *network, session };
           if InTributaryDb::get(&txn, set).is_some() && RetiredTributaryDb::get(&txn, set).is_none()
@@ -264,10 +264,10 @@ async fn handle_processor_message<D: Db, P: P2p>(
       }
       // We'll only fire these if we are the Substrate signer, making the Tributary relevant
       coordinator::ProcessorMessage::BatchPreprocess { id, .. } => {
-        Some(SubstrateDb::<D>::session_for_key(&txn, &id.key).unwrap())
+        SessionDb::get(&txn, &id.key)
       }
       coordinator::ProcessorMessage::BatchShare { id, .. } => {
-        Some(SubstrateDb::<D>::session_for_key(&txn, &id.key).unwrap())
+        SessionDb::get(&txn, &id.key)
       }
     },
     // These don't return a relevant Tributary as there's no Tributary with action expected
