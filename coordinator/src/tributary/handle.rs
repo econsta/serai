@@ -1,7 +1,6 @@
 use core::{ops::Deref, future::Future};
 use std::collections::HashMap;
 use std::io::Read;
-use scale::Encode;
 use zeroize::Zeroizing;
 
 use ciphersuite::{group::GroupEncoding, Ciphersuite, Ristretto};
@@ -59,8 +58,7 @@ fn read_known_to_exist_data<G: Get>(
 ) -> Option<HashMap<Participant, Vec<u8>>> {
   let mut data = HashMap::new();
   for validator in spec.validators().iter().map(|validator| validator.0) {
-    let key = [data_spec.as_key(spec.genesis()).as_slice(), validator.to_bytes().as_ref()].concat();
-    if let Some(bytes) = DataDb::get(getter, key) {
+    if let Some(bytes) = DataDb::get(getter, data_spec.as_key(spec.genesis()).to_vec(), validator.to_bytes() as [u8; 32]) {
       data.insert(spec.i(validator).unwrap(), bytes);
     };
   }
@@ -156,8 +154,7 @@ pub(crate) async fn handle_application_tx<
     };
 
     // If they've already published a TX for this attempt, slash
-    let data_key = [data_spec.as_key(genesis).as_slice(), signed.signer.to_bytes().as_ref()].concat();
-    if DataDb::get(txn, data_key).is_some() {
+    if DataDb::get(txn, data_spec.as_key(genesis), signed.signer.to_bytes() as [u8; 32]).is_some() {
       fatal_slash::<D>(txn, genesis, signed.signer.to_bytes(), "published data multiple times");
       return None;
     }
@@ -190,9 +187,8 @@ pub(crate) async fn handle_application_tx<
       .map(u16::from_le_bytes)
       .unwrap_or(0);
     received += 1;
-    DataReceivedDb::set(txn, recvd_key, &received.to_le_bytes());
-    let data_key = [data_spec.as_key(genesis).as_slice(), signed.signer.to_bytes().as_ref()].concat();
-    DataDb::set(txn, data_key, &bytes);
+    DataReceivedDb::set(txn,&recvd_key, &received.to_le_bytes());
+    DataDb::set(txn, data_spec.as_key(genesis), signed.signer.to_bytes() as [u8; 32], &bytes);
 
     // If we have all the needed commitments/preprocesses/shares, tell the processor
     // TODO: This needs to be coded by weight, not by validator count
@@ -328,9 +324,7 @@ pub(crate) async fn handle_application_tx<
     }
 
     Transaction::SubstrateBlock(block) => {
-      let gen_slice: &[u8] = genesis.as_ref();
-      let key = [gen_slice, &block.to_le_bytes().as_ref()].concat();
-      let plan_ids = PlanIdsDb::get(txn, key).map(|bytes| {
+      let plan_ids = PlanIdsDb::get(txn, genesis, &block).map(|bytes| {
         let mut res = vec![];
         let mut bytes_ref = bytes.as_slice();
         while !bytes_ref.is_empty() {
@@ -364,7 +358,7 @@ pub(crate) async fn handle_application_tx<
       ) {
         Some(Some(preprocesses)) => {
           NonceDecider::<D>::selected_for_signing_batch(txn, genesis, data.plan);
-          let key = KeyPairDb::get(txn, spec.set().encode()).unwrap().0 .0.to_vec();
+          let key = KeyPairDb::get(txn, spec.set()).unwrap().0 .0.to_vec();
           processors
             .send(
               spec.set().network,
@@ -391,7 +385,7 @@ pub(crate) async fn handle_application_tx<
         &data.signed,
       ) {
         Some(Some(shares)) => {
-          let key = KeyPairDb::get(txn, spec.set().encode()).unwrap().0 .0.to_vec();
+          let key = KeyPairDb::get(txn, spec.set()).unwrap().0 .0.to_vec();
           processors
             .send(
               spec.set().network,
@@ -411,7 +405,7 @@ pub(crate) async fn handle_application_tx<
     }
 
     Transaction::SignPreprocess(data) => {
-      let key_pair = KeyPairDb::get(txn, spec.set().encode());
+      let key_pair = KeyPairDb::get(txn, spec.set());
       match handle(
         txn,
         &DataSpecification {
@@ -446,7 +440,7 @@ pub(crate) async fn handle_application_tx<
       }
     }
     Transaction::SignShare(data) => {
-      let key_pair = KeyPairDb::get(txn, spec.set().encode());
+      let key_pair = KeyPairDb::get(txn, spec.set());
       match handle(
         txn,
         &DataSpecification {
@@ -487,7 +481,7 @@ pub(crate) async fn handle_application_tx<
       );
       // TODO: Confirm this is a valid plan ID
       // TODO: Confirm this signer hasn't prior published a completion
-      let Some(key_pair) = KeyPairDb::get(txn, spec.set().encode()) else { todo!() };
+      let Some(key_pair) = KeyPairDb::get(txn, spec.set()) else { todo!() };
       processors
         .send(
           spec.set().network,

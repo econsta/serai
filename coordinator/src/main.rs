@@ -39,7 +39,6 @@ mod tributary;
 use crate::tributary::{
   TributarySpec, SignData, Transaction, NonceDecider, scanner::RecognizedIdType, PlanIdsDb,
 };
-use crate::db::InTributaryDb;
 
 mod db;
 use db::*;
@@ -54,8 +53,6 @@ use processors::Processors;
 
 mod substrate;
 use substrate::SubstrateDb;
-
-use scale::Encode;
 
 #[cfg(test)]
 pub mod tests;
@@ -81,7 +78,7 @@ async fn add_tributary<D: Db, Pro: Processors, P: P2p>(
   tributaries: &broadcast::Sender<TributaryEvent<D, P>>,
   spec: TributarySpec,
 ) {
-  if RetiredTributaryDb::get(&db, spec.set().encode()).is_some() {
+  if RetiredTributaryDb::get(&db, spec.set()).is_some() {
     log::info!("not adding tributary {:?} since it's been retired", spec.set());
   }
 
@@ -139,7 +136,7 @@ async fn publish_signed_transaction<D: Db, P: P2p>(
 
     // Safe as we should deterministically create transactions, meaning if this is already on-disk,
     // it's what we're saving now
-    SignedTransactionDb::set(txn, signed.nonce.to_be_bytes(), &tx.serialize());
+    SignedTransactionDb::set(txn, signed.nonce, &tx.serialize());
 
     signer
   } else {
@@ -176,7 +173,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
   network: NetworkId,
   msg: &processors::Message,
 ) -> bool {
-  if HandledMessageDb::get(db, (msg.network, msg.id).encode()).is_some() {
+  if HandledMessageDb::get(db, msg.network, msg.id).is_some() {
     return true;
   }
 
@@ -222,7 +219,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
           let session = SubstrateDb::<D>::session_for_key(&txn, &key).unwrap();
           // Only keep them if we're in the Tributary AND they haven't been retied
           let set = ValidatorSet { network: *network, session };
-          if InTributaryDb::get(&txn, set.encode()).is_some() && RetiredTributaryDb::get(&txn, set.encode()).is_none()
+          if InTributaryDb::get(&txn, set).is_some() && RetiredTributaryDb::get(&txn, set).is_none()
           {
             sessions.push((session, key));
           }
@@ -241,9 +238,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
             .iter()
             .filter_map(|plan| Some(plan.id).filter(|_| plan.key == key))
             .collect::<Vec<_>>();
-          let gen_slice: &[u8] = &tributary.spec.genesis();
-          let key = [gen_slice, &block.to_le_bytes().as_ref()].concat();
-          PlanIdsDb::set(&mut txn, key, &plans.concat());
+          PlanIdsDb::set(&mut txn, tributary.spec.genesis(), block, &plans.concat());
           let tx = Transaction::SubstrateBlock(*block);
           log::trace!("processor message effected transaction {}", hex::encode(tx.hash()));
           log::trace!("providing transaction {}", hex::encode(tx.hash()));
@@ -308,7 +303,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
         log::debug!("received batch {:?} {}", batch.batch.network, batch.batch.id);
 
         // Save this batch to the disk
-        BatchDb::set(&mut txn, (batch.batch.network, batch.batch.id).encode(), &batch.clone());
+        BatchDb::set(&mut txn, batch.batch.network, batch.batch.id, &batch.clone());
 
         // Get the next-to-execute batch ID
         let mut next = substrate::get_expected_next_batch(serai, network).await;
@@ -316,7 +311,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
         // Since we have a new batch, publish all batches yet to be published to Serai
         // This handles the edge-case where batch n+1 is signed before batch n is
         let mut batches = VecDeque::new();
-        while let Some(batch) = BatchDb::get(&txn, (network, next).encode()) {
+        while let Some(batch) = BatchDb::get(&txn, network, next) {
           batches.push_back(batch);
           next += 1;
         }
@@ -372,7 +367,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
         if let Some(start_id) = start_id {
           let last_id = last_id.unwrap();
           for batch in start_id .. last_id {
-            if let Some(session) = LookupHandoverBatchDb::get(&txn, (msg.network, batch).encode()) {
+            if let Some(session) = LookupHandoverBatchDb::get(&txn, msg.network, batch) {
               // relevant may already be Some. This is a safe over-write, as we don't need to
               // be concerned for handovers of Tributaries which have completed their handovers
               // While this does bypass the checks that Tributary would've performed at the
@@ -397,7 +392,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
   if let Some(relevant_tributary_value) = relevant_tributary {
     if RetiredTributaryDb::get(
       &txn,
-      ValidatorSet { network: msg.network, session: relevant_tributary_value }.encode(),
+      ValidatorSet { network: msg.network, session: relevant_tributary_value },
     ).is_some() {
       relevant_tributary = None;
     }
@@ -547,8 +542,8 @@ async fn handle_processor_message<D: Db, P: P2p>(
 
             // If this is the new key's first Batch, only create this TX once we verify all
             // all prior published `Batch`s
-            let last_received = LastRecievedBatchDb::get(&txn, msg.network.encode()).unwrap();
-            let handover_batch = HandoverBatchDb::get(&txn, spec.set().encode());
+            let last_received = LastRecievedBatchDb::get(&txn, msg.network).unwrap();
+            let handover_batch = HandoverBatchDb::get(&txn, spec.set());
             if handover_batch.is_none() {
               HandoverBatchDb::set_handover_batch(&mut txn, spec.set(), last_received);
               if last_received != 0 {
@@ -580,11 +575,11 @@ async fn handle_processor_message<D: Db, P: P2p>(
             //
             // To fix this, if this is after the handover `Batch` and we have yet to verify
             // publication of the handover `Batch`, don't yet yield the provided.
-            let handover_batch = HandoverBatchDb::get(&txn, spec.set().encode()).unwrap();
+            let handover_batch = HandoverBatchDb::get(&txn, spec.set()).unwrap();
             let intended = Transaction::Batch(block.0, id.id);
             let mut res = vec![intended.clone()];
             if last_received > handover_batch {
-              if let Some(last_verified) = LastRecievedBatchDb::get(&txn, msg.network.encode()) {
+              if let Some(last_verified) = LastRecievedBatchDb::get(&txn, msg.network) {
                 if last_verified < handover_batch {
                   res = vec![];
                 }
@@ -683,7 +678,7 @@ async fn handle_processor_message<D: Db, P: P2p>(
       }
     }
   }
-  HandledMessageDb::set(&mut txn, (msg.network, msg.id).encode(), &vec![] as &Vec<u8>);
+  HandledMessageDb::set(&mut txn, msg.network, msg.id, &vec![] as &Vec<u8>);
   txn.commit();
 
   true
@@ -877,7 +872,7 @@ pub async fn run<D: Db, Pro: Processors, P: P2p>(
         // This waits until the necessary preprocess is available 0,
         let get_preprocess = |raw_db, id_type, id| async move {
           loop {
-            let Some(preprocess) = FirstPreprocessDb::get(raw_db, (set.network, id_type, id).encode())
+            let Some(preprocess) = FirstPreprocessDb::get(raw_db, set.network, id_type, id)
             else {
               sleep(Duration::from_millis(100)).await;
               continue;
@@ -914,7 +909,7 @@ pub async fn run<D: Db, Pro: Processors, P: P2p>(
           let tributaries = tributaries.read().await;
           let Some(tributary) = tributaries.get(&genesis) else {
             // If we don't have this Tributary because it's retired, break and move on
-            if RetiredTributaryDb::get(&raw_db, set.encode()).is_some() {
+            if RetiredTributaryDb::get(&raw_db, set).is_some() {
               break;
             }
 

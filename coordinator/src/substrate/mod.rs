@@ -4,7 +4,6 @@ use std::{
   collections::{HashSet, HashMap},
 };
 
-use scale::Encode;
 use zeroize::Zeroizing;
 
 use ciphersuite::{group::GroupEncoding, Ciphersuite, Ristretto};
@@ -306,7 +305,7 @@ async fn handle_block<D: Db, Pro: Processors>(
         // Immediately ensure this key pair is accessible to the tributary, before we fire any
         // events off of it
         let mut txn = db.0.txn();
-        KeyPairDb::set(&mut txn, set.encode(), &key_pair);
+        KeyPairDb::set(&mut txn, set, &key_pair);
         txn.commit();
 
         handle_key_gen(&mut db.0, processors, serai, &block, set, key_pair).await?;
@@ -502,12 +501,12 @@ pub(crate) async fn verify_published_batches<D: Db>(
   optimistic_up_to: u32,
 ) -> Option<u32> {
   // TODO: Localize from MainDb to SubstrateDb
-  let last = crate::LastVerifiedBatchDb::get(txn, network.encode());
+  let last = crate::LastVerifiedBatchDb::get(txn, network);
   for id in last.map(|last| last + 1).unwrap_or(0) ..= optimistic_up_to {
     let Some(on_chain) = SubstrateDb::<D>::batch_instructions_hash(txn, network, id) else {
       break;
     };
-    let off_chain = ExpectedBatchDb::get(txn, (network, id).encode()).unwrap();
+    let off_chain = ExpectedBatchDb::get(txn, network, id).unwrap();
     if on_chain != off_chain {
       // Halt operations on this network and spin, as this is a critical fault
       loop {
@@ -522,8 +521,8 @@ pub(crate) async fn verify_published_batches<D: Db>(
         sleep(Duration::from_secs(60)).await;
       }
     }
-    LastVerifiedBatchDb::set(txn, network.encode(), &id);
+    LastVerifiedBatchDb::set(txn, network, &id);
   }
 
-  LastVerifiedBatchDb::get(txn, network.encode())
+  LastVerifiedBatchDb::get(txn, network)
 }

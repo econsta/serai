@@ -1,7 +1,7 @@
-use serai_client::validator_sets::primitives::KeyPair;
+use serai_client::validator_sets::primitives::{KeyPair, ValidatorSet};
 
 use serai_db::create_db;
-
+use scale::Encode;
 pub use serai_db::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,16 +48,16 @@ impl DataSpecification {
 
 create_db!(
   TributaryDb {
-    LastBlockDb: [u8; 32],
-    FatalSlashesDb: Vec<u8>,
-    FatallySlashedDb: Vec<u8>,
-    PlanIdsDb: Vec<u8>,
-    CurrentlyCompletingKeyPairDb: KeyPair,
-    KeyPairDb: KeyPair,
-    AttemptDb: Vec<u8>,
-    DataReceivedDb: Vec<u8>,
-    DataDb: Vec<u8>,
-    EventDb: Vec<u8>
+    LastBlockDb: (genesis: [u8; 32]) -> [u8; 32],
+    FatalSlashesDb: (genesis: [u8; 32]) -> Vec<u8>,
+    FatallySlashedDb: (genesis: [u8; 32]) -> Vec<u8>,
+    PlanIdsDb: (genesis: [u8; 32], block: &u64) -> Vec<u8>,
+    CurrentlyCompletingKeyPairDb: (genesis: [u8; 32]) -> KeyPair,
+    KeyPairDb: (set: ValidatorSet) -> KeyPair,
+    AttemptDb: (key: Vec<u8>) -> Vec<u8>,
+    DataReceivedDb: (key: &Vec<u8>) -> Vec<u8>,
+    DataDb: (spec: Vec<u8>, signer: [u8; 32]) -> Vec<u8>,
+    EventDb: (key: Vec<u8>) -> Vec<u8>
   }
 );
 

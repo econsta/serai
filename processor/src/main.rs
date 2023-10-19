@@ -291,7 +291,7 @@ async fn handle_coordinator_msg<D: Db, N: Network, Co: Coordinator>(
             // Set this variable so when we get the next Batch event, we can handle it
             let mut buf = (set, key_pair).encode();
             buf.extend(block_before_queue_block.as_ref());
-            PendingActivationsDb::set(txn, [], &buf);
+            PendingActivationsDb::set(txn, &buf);
           }
         }
 
@@ -503,9 +503,9 @@ async fn run<N: Network, D: Db, Co: Coordinator>(mut raw_db: D, network: N, mut 
         last_coordinator_msg = Some(msg.id);
 
         // Only handle this if we haven't already
-        if HandledMessageDb::get(&main_db, msg.id.encode()).is_none() {
+        if HandledMessageDb::get(&main_db, msg.id).is_none() {
           let data: Vec<u8> = vec![];
-          HandledMessageDb::set(txn as &mut D::Transaction<'_>, msg.id.to_le_bytes(), &data);
+          HandledMessageDb::set(txn as &mut D::Transaction<'_>, msg.id, &data);
 
           // This is isolated to better think about how its ordered, or rather, about how the other
           // cases aren't ordered

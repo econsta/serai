@@ -70,7 +70,7 @@ async fn handle_block<
   #[allow(clippy::explicit_counter_loop)] // event_id isn't TX index. It just currently lines up
   for tx in block.transactions {
     let event_key = [hash.as_slice(), &event_id.to_le_bytes()].concat();
-    if EventDb::get(db, &event_key).is_some() {
+    if EventDb::get(db, event_key).is_some() {
       event_id += 1;
       continue;
     }
@@ -198,7 +198,7 @@ pub(crate) async fn scan_tributaries_task<
             let reader = tributary.reader();
             loop {
               // Check if the set was retired, and if so, don't further operate
-              if crate::db::RetiredTributaryDb::get(&raw_db, spec.set().encode()).is_some() {
+              if crate::db::RetiredTributaryDb::get(&raw_db, spec.set()).is_some() {
                 break;
               }
 
