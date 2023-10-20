@@ -3,6 +3,7 @@ use std::collections::{VecDeque, HashMap};
 
 use rand_core::OsRng;
 
+use serai_db::create_db;
 use transcript::{Transcript, RecommendedTranscript};
 use ciphersuite::group::GroupEncoding;
 use frost::{
@@ -19,7 +20,7 @@ use log::{info, debug, warn};
 
 use scale::Encode;
 use serai_client::{
-  primitives::NetworkId,
+  primitives::{NetworkId, BlockHash},
   in_instructions::primitives::{Batch, SignedBatch, batch_message},
 };
 
@@ -44,38 +45,13 @@ pub enum SubstrateSignerEvent {
   ProcessorMessage(ProcessorMessage),
   SignedBatch(SignedBatch),
 }
-
-#[derive(Debug)]
-struct SubstrateSignerDb<D: Db>(D);
-impl<D: Db> SubstrateSignerDb<D> {
-  fn sign_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    D::key(b"SUBSTRATE_SIGNER", dst, key)
+create_db!(
+  SubstrateSignerDb {
+    CompletedDb: (id: [u8; 32]) -> [u8; 0],
+    AttemptDb: (id: &SignId) -> [u8; 0],
+    BatchDb: (block: BlockHash) -> SignedBatch
   }
-
-  fn completed_key(id: [u8; 32]) -> Vec<u8> {
-    Self::sign_key(b"completed", id)
-  }
-  fn complete(txn: &mut D::Transaction<'_>, id: [u8; 32]) {
-    txn.put(Self::completed_key(id), []);
-  }
-  fn completed<G: Get>(getter: &G, id: [u8; 32]) -> bool {
-    getter.get(Self::completed_key(id)).is_some()
-  }
-
-  fn attempt_key(id: &SignId) -> Vec<u8> {
-    Self::sign_key(b"attempt", id.encode())
-  }
-  fn attempt(txn: &mut D::Transaction<'_>, id: &SignId) {
-    txn.put(Self::attempt_key(id), []);
-  }
-  fn has_attempt<G: Get>(getter: &G, id: &SignId) -> bool {
-    getter.get(Self::attempt_key(id)).is_some()
-  }
-
-  fn save_batch(txn: &mut D::Transaction<'_>, batch: &SignedBatch) {
-    txn.put(Self::sign_key(b"batch", batch.batch.block), batch.encode());
-  }
-}
+);
 
 pub struct SubstrateSigner<D: Db> {
   db: PhantomData<D>,
@@ -146,7 +122,7 @@ impl<D: Db> SubstrateSigner<D> {
 
   async fn attempt(&mut self, txn: &mut D::Transaction<'_>, id: [u8; 32], attempt: u32) {
     // See above commentary for why this doesn't emit SignedBatch
-    if SubstrateSignerDb::<D>::completed(txn, id) {
+    if CompletedDb::get(txn, id).is_some() {
       return;
     }
 
@@ -193,7 +169,7 @@ impl<D: Db> SubstrateSigner<D> {
     // branch again for something we've already attempted
     //
     // Only run if this hasn't already been attempted
-    if SubstrateSignerDb::<D>::has_attempt(txn, &id) {
+    if AttemptDb::get(txn, &id).is_some() {
       warn!(
         "already attempted batch {}, attempt #{}. this is an error if we didn't reboot",
         hex::encode(id.id),
@@ -202,7 +178,7 @@ impl<D: Db> SubstrateSigner<D> {
       return;
     }
 
-    SubstrateSignerDb::<D>::attempt(txn, &id);
+    AttemptDb::set(txn, &id, &[] as &[u8; 0]);
 
     // b"substrate" is a literal from sp-core
     let machine = AlgorithmMachine::new(Schnorrkel::new(b"substrate"), self.keys.clone());
@@ -223,7 +199,7 @@ impl<D: Db> SubstrateSigner<D> {
   pub async fn sign(&mut self, txn: &mut D::Transaction<'_>, batch: Batch) {
     debug_assert_eq!(self.network, batch.network);
     let id = sign_id(batch.network, batch.id);
-    if SubstrateSignerDb::<D>::completed(txn, id) {
+    if CompletedDb::get(txn, id).is_some() {
       debug!("Sign batch order for ID we've already completed signing");
       // See batch_signed for commentary on why this simply returns
       return;
@@ -335,8 +311,8 @@ impl<D: Db> SubstrateSigner<D> {
           SignedBatch { batch: self.signable.remove(&id.id).unwrap(), signature: sig.into() };
 
         // Save the batch in case it's needed for recovery
-        SubstrateSignerDb::<D>::save_batch(txn, &batch);
-        SubstrateSignerDb::<D>::complete(txn, id.id);
+        BatchDb::set(txn, batch.batch.block, &batch);
+        CompletedDb::set(txn, id.id, &[] as &[u8; 0]);
 
         // Stop trying to sign for this batch
         assert!(self.attempt.remove(&id.id).is_some());
@@ -360,7 +336,7 @@ impl<D: Db> SubstrateSigner<D> {
     let sign_id = sign_id(self.network, id);
 
     // Stop trying to sign for this batch
-    SubstrateSignerDb::<D>::complete(txn, sign_id);
+    CompletedDb::set(txn, sign_id, &[] as &[u8; 0]);
 
     self.signable.remove(&sign_id);
     self.attempt.remove(&sign_id);
