@@ -26,7 +26,7 @@ pub mod scanner;
 use scanner::{ScannerEvent, ScannerHandle, Scanner};
 
 mod db;
-use db::MultisigsDb;
+use db::*;
 
 #[cfg(not(test))]
 mod scheduler;
@@ -38,6 +38,8 @@ use crate::{
   Get, Db, Payment, PostFeeBranch, Plan,
   networks::{OutputType, Output, Transaction, SignableTransaction, Block, Network, get_block},
 };
+
+use self::db::NextBatchDb;
 
 // InInstructionWithBalance from an external output
 fn instruction_from_output<N: Network>(output: &N::Output) -> Option<InInstructionWithBalance> {
@@ -145,7 +147,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
 
       // Load any TXs being actively signed
       let key = key.to_bytes();
-      for (block_number, plan) in MultisigsDb::<N, D>::active_plans(raw_db, key.as_ref()) {
+      for (block_number, plan) in PlanDb::active_plans::<N>(raw_db, key.as_ref()) {
         let block_number = block_number.try_into().unwrap();
 
         let fee = get_fee(network, block_number).await;
@@ -530,12 +532,12 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         }
         OutputType::Change => {
           // If the TX containing this output resolved an Eventuality...
-          if let Some(plan) = MultisigsDb::<N, D>::resolved_plan(txn, output.tx_id()) {
+          if let Some(plan) = ResolvedDb::get(txn, output.tx_id().as_ref()) {
             // And the Eventuality had change...
             // We need this check as Eventualities have a race condition and can't be relied
             // on, as extensively detailed above. Eventualities explicitly with change do have
             // a safe timing window however
-            if MultisigsDb::<N, D>::plan_by_key_with_self_change(
+            if PlanDb::plan_by_key_with_self_change::<N>(
               txn,
               // Pass the key so the DB checks the Plan's key is this multisig's, preventing a
               // potential issue where the new multisig creates a Plan with change *and a
@@ -674,7 +676,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
 
         let key = plan.key;
         let key_bytes = key.to_bytes();
-        MultisigsDb::<N, D>::save_active_plan(
+        PlanDb::save_active_plan::<N>(
           txn,
           key_bytes.as_ref(),
           block_number.try_into().unwrap(),
@@ -693,7 +695,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
           // If we can't successfully create a forwarding TX, simply drop this
           if let Some(tx) = &tx {
             instruction.balance.amount.0 -= tx.0.fee();
-            MultisigsDb::<N, D>::save_forwarded_output(txn, instruction);
+            ForwardedOutputDb::save_forwarded_output(txn, instruction);
           }
         }
 
@@ -782,7 +784,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
             }
 
             if let Some(instruction) =
-              MultisigsDb::<N, D>::take_forwarded_output(txn, output.amount())
+              ForwardedOutputDb::take_forwarded_output(txn, output.amount())
             {
               instruction
             } else {
@@ -795,7 +797,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
           if Some(output.key()) == self.new.as_ref().map(|new| new.key) {
             match step {
               RotationStep::UseExisting => {
-                MultisigsDb::<N, D>::save_delayed_output(txn, instruction);
+                DelayedOutputDb::save_delayed_output(txn, instruction);
                 continue;
               }
               RotationStep::NewAsChange |
@@ -813,13 +815,13 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
           RotationStep::NewAsChange |
           RotationStep::ForwardFromExisting |
           RotationStep::ClosingExisting => {
-            instructions.extend(MultisigsDb::<N, D>::take_delayed_outputs(txn));
+            instructions.extend(DelayedOutputDb::take_delayed_outputs(txn));
           }
         }
 
         let mut block_hash = [0; 32];
         block_hash.copy_from_slice(block.as_ref());
-        let mut batch_id = MultisigsDb::<N, D>::next_batch_id(txn);
+        let mut batch_id = NextBatchDb::get(txn).unwrap();
 
         // start with empty batch
         let mut batches = vec![Batch {
@@ -852,7 +854,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         }
 
         // Save the next batch ID
-        MultisigsDb::<N, D>::set_next_batch_id(txn, batch_id + 1);
+        NextBatchDb::set(txn, &(batch_id + 1));
 
         (
           block_number,
@@ -871,7 +873,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
       // within the block. Unknown Eventualities may have their Completed events emitted after
       // ScannerEvent::Block however.
       ScannerEvent::Completed(key, block_number, id, tx) => {
-        MultisigsDb::<N, D>::resolve_plan(txn, &key, id, tx.id());
+        ResolvedDb::resolve_plan::<N>(txn, &key, id, tx.id());
         (block_number, MultisigEvent::Completed(key, id, tx))
       }
     };
@@ -893,7 +895,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
     let scheduler_is_empty = closing && existing.scheduler.empty();
     // Nothing is still being signed
     let no_active_plans = scheduler_is_empty &&
-      MultisigsDb::<N, D>::active_plans(txn, existing.key.to_bytes().as_ref()).is_empty();
+      PlanDb::active_plans::<N>(txn, existing.key.to_bytes().as_ref()).is_empty();
 
     self
       .scanner
