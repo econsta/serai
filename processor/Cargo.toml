@@ -55,7 +55,7 @@ log = "0.4"
 env_logger = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
-serai-db = { path = "../common/db", default-features = false, features = ["rocksdb"] }
+serai-db = { path = "../common/db", default-features = true, features = ["rocksdb"] }
 serai-env = { path = "../common/env" }
 serai-client = { path = "../substrate/client", default-features = false }
 

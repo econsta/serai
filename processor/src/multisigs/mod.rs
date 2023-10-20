@@ -154,7 +154,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
 
       // Load any TXs being actively signed
       let key = key.to_bytes();
-      for (block_number, plan) in PlanDb::active_plans::<N>(raw_db, key.as_ref()) {
+      for (block_number, plan, operating_costs) in PlanDb::active_plans::<N>(raw_db, key.as_ref()) {
         let block_number = block_number.try_into().unwrap();
 
         let fee_rate = get_fee_rate(network, block_number).await;
@@ -684,7 +684,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         let key = plan.key;
         let key_bytes = key.to_bytes();
   
-        let running_operating_costs = MultisigsDb::<N, D>::take_operating_costs(txn);
+        let running_operating_costs = OperatingCostsDb::take_operating_costs(txn);
 
         PlanDb::save_active_plan::<N>(
           txn,
@@ -703,7 +703,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         // 'Drop' running_operating_costs to ensure only operating_costs is used from here on out
         #[allow(unused, clippy::let_unit_value)]
         let running_operating_costs: () = ();
-        MultisigsDb::<N, D>::set_operating_costs(txn, operating_costs);
+        OperatingCostsDb::set_operating_costs(txn, operating_costs);
 
         // If this is a Plan for an output we're forwarding, we need to save the InInstruction for
         // its output under the amount successfully forwarded
