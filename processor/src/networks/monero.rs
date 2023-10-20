@@ -38,8 +38,7 @@ use crate::{
   networks::{
     NetworkError, Block as BlockTrait, OutputType, Output as OutputTrait,
     Transaction as TransactionTrait, SignableTransaction as SignableTransactionTrait,
-    Eventuality as EventualityTrait, EventualitiesTracker, PostFeeBranch, Network, drop_branches,
-    amortize_fee,
+    Eventuality as EventualityTrait, EventualitiesTracker, Network,
   },
 };
 
@@ -205,6 +204,125 @@ impl Monero {
     scanner.register_subaddress(BRANCH_SUBADDRESS.unwrap());
     scanner.register_subaddress(CHANGE_SUBADDRESS.unwrap());
     scanner
+  }
+
+  async fn make_signable_transaction(
+    &self,
+    block_number: usize,
+    mut plan: Plan<Self>,
+    fee_rate: Fee,
+    calculating_fee: bool,
+  ) -> Result<Option<(RecommendedTranscript, MSignableTransaction)>, NetworkError> {
+    // Get the protocol for the specified block number
+    // For now, this should just be v16, the latest deployed protocol, since there's no upcoming
+    // hard fork to be mindful of
+    let get_protocol = || Protocol::v16;
+
+    #[cfg(not(test))]
+    let protocol = get_protocol();
+    // If this is a test, we won't be using a mainnet node and need a distinct protocol
+    // determination
+    // Just use whatever the node expects
+    #[cfg(test)]
+    let protocol = self.rpc.get_protocol().await.unwrap();
+
+    // Hedge against the above codegen failing by having an always included runtime check
+    if !cfg!(test) {
+      assert_eq!(protocol, get_protocol());
+    }
+
+    // Check a fork hasn't occurred which this processor hasn't been updated for
+    assert_eq!(protocol, self.rpc.get_protocol().await.map_err(|_| NetworkError::ConnectionError)?);
+
+    let spendable_outputs = plan.inputs.iter().cloned().map(|input| input.0).collect::<Vec<_>>();
+
+    let mut transcript = plan.transcript();
+
+    // All signers need to select the same decoys
+    // All signers use the same height and a seeded RNG to make sure they do so.
+    let decoys = Decoys::select(
+      &mut ChaCha20Rng::from_seed(transcript.rng_seed(b"decoys")),
+      &self.rpc,
+      protocol.ring_len(),
+      block_number + 1,
+      &spendable_outputs,
+    )
+    .await
+    .map_err(|_| NetworkError::ConnectionError)?;
+
+    let inputs = spendable_outputs.into_iter().zip(decoys).collect::<Vec<_>>();
+
+    // Monero requires at least two outputs
+    // If we only have one output planned, add a dummy payment
+    let outputs = plan.payments.len() + usize::from(u8::from(plan.change.is_some()));
+    if outputs == 0 {
+      return Ok(None);
+    } else if outputs == 1 {
+      plan.payments.push(Payment {
+        address: Address::new(
+          ViewPair::new(EdwardsPoint::generator().0, Zeroizing::new(Scalar::ONE.0))
+            .address(MoneroNetwork::Mainnet, AddressSpec::Standard),
+        )
+        .unwrap(),
+        amount: 0,
+        data: None,
+      });
+    }
+
+    let mut payments = vec![];
+    for payment in &plan.payments {
+      // If we're solely estimating the fee, don't actually specify an amount
+      // This won't affect the fee calculation yet will ensure we don't hit an out of funds error
+      payments
+        .push((payment.address.clone().into(), if calculating_fee { 0 } else { payment.amount }));
+    }
+
+    match MSignableTransaction::new(
+      protocol,
+      // Use the plan ID as the r_seed
+      // This perfectly binds the plan while simultaneously allowing verifying the plan was
+      // executed with no additional communication
+      Some(Zeroizing::new(plan.id())),
+      inputs.clone(),
+      payments,
+      plan.change.map(|change| Change::fingerprintable(change.into())),
+      vec![],
+      fee_rate,
+    ) {
+      Ok(signable) => Ok(Some((transcript, signable))),
+      Err(e) => match e {
+        TransactionError::MultiplePaymentIds => {
+          panic!("multiple payment IDs despite not supporting integrated addresses");
+        }
+        TransactionError::NoInputs |
+        TransactionError::NoOutputs |
+        TransactionError::InvalidDecoyQuantity |
+        TransactionError::NoChange |
+        TransactionError::TooManyOutputs |
+        TransactionError::TooMuchData |
+        TransactionError::TooLargeTransaction |
+        TransactionError::WrongPrivateKey => {
+          panic!("created an Monero invalid transaction: {e}");
+        }
+        TransactionError::ClsagError(_) |
+        TransactionError::InvalidTransaction(_) |
+        TransactionError::FrostError(_) => {
+          panic!("supposedly unreachable (at this time) Monero error: {e}");
+        }
+        TransactionError::NotEnoughFunds { inputs, outputs, fee } => {
+          log::debug!(
+            "Monero NotEnoughFunds. inputs: {:?}, outputs: {:?}, fee: {fee}",
+            inputs,
+            outputs
+          );
+          Ok(None)
+        }
+        TransactionError::RpcError(e) => {
+          log::error!("RpcError when preparing transaction: {e:?}");
+          Err(NetworkError::ConnectionError)
+        }
+      },
+    }
   }
 
   #[cfg(test)]
@@ -394,148 +512,33 @@ impl Network for Monero {
     res
   }
 
-  async fn prepare_send(
+  async fn needed_fee(
     &self,
     block_number: usize,
-    mut plan: Plan<Self>,
-    fee: Fee,
-  ) -> Result<(Option<(SignableTransaction, Eventuality)>, Vec<PostFeeBranch>), NetworkError> {
-    // Sanity check this has at least one output planned
-    assert!((!plan.payments.is_empty()) || plan.change.is_some());
-
-    // Get the protocol for the specified block number
-    // For now, this should just be v16, the latest deployed protocol, since there's no upcoming
-    // hard fork to be mindful of
-    let get_protocol = || Protocol::v16;
-
-    #[cfg(not(test))]
-    let protocol = get_protocol();
-    // If this is a test, we won't be using a mainnet node and need a distinct protocol
-    // determination
-    // Just use whatever the node expects
-    #[cfg(test)]
-    let protocol = self.rpc.get_protocol().await.unwrap();
-
-    // Hedge against the above codegen failing by having an always included runtime check
-    if !cfg!(test) {
-      assert_eq!(protocol, get_protocol());
-    }
-
-    // Check a fork hasn't occurred which this processor hasn't been updated for
-    assert_eq!(protocol, self.rpc.get_protocol().await.map_err(|_| NetworkError::ConnectionError)?);
-
-    let spendable_outputs = plan.inputs.iter().cloned().map(|input| input.0).collect::<Vec<_>>();
-
-    let mut transcript = plan.transcript();
-
-    // All signers need to select the same decoys
-    // All signers use the same height and a seeded RNG to make sure they do so.
-    let decoys = Decoys::select(
-      &mut ChaCha20Rng::from_seed(transcript.rng_seed(b"decoys")),
-      &self.rpc,
-      protocol.ring_len(),
-      block_number + 1,
-      &spendable_outputs,
+    plan: &Plan<Self>,
+    fee_rate: Fee,
+  ) -> Result<Option<u64>, NetworkError> {
+    Ok(
+      self
+        .make_signable_transaction(block_number, plan.clone(), fee_rate, true)
+        .await?
+        .map(|(_, signable)| signable.fee()),
     )
-    .await
-    .map_err(|_| NetworkError::ConnectionError)?;
+  }
 
-    let inputs = spendable_outputs.into_iter().zip(decoys).collect::<Vec<_>>();
-
-    let signable = |mut plan: Plan<Self>, tx_fee: Option<_>| {
-      // Monero requires at least two outputs
-      // If we only have one output planned, add a dummy payment
-      let outputs = plan.payments.len() + usize::from(u8::from(plan.change.is_some()));
-      if outputs == 0 {
-        return Ok(None);
-      } else if outputs == 1 {
-        plan.payments.push(Payment {
-          address: Address::new(
-            ViewPair::new(EdwardsPoint::generator().0, Zeroizing::new(Scalar::ONE.0))
-              .address(MoneroNetwork::Mainnet, AddressSpec::Standard),
-          )
-          .unwrap(),
-          amount: 0,
-          data: None,
-        });
-      }
-
-      let mut payments = vec![];
-      for payment in &plan.payments {
-        // If we're solely estimating the fee, don't actually specify an amount
-        // This won't affect the fee calculation yet will ensure we don't hit an out of funds error
-        payments.push((
-          payment.address.clone().into(),
-          if tx_fee.is_none() { 0 } else { payment.amount },
-        ));
-      }
-
-      match MSignableTransaction::new(
-        protocol,
-        // Use the plan ID as the r_seed
-        // This perfectly binds the plan while simultaneously allowing verifying the plan was
-        // executed with no additional communication
-        Some(Zeroizing::new(plan.id())),
-        inputs.clone(),
-        payments,
-        plan.change.map(|change| Change::fingerprintable(change.into())),
-        vec![],
-        fee,
-      ) {
-        Ok(signable) => Ok(Some(signable)),
-        Err(e) => match e {
-          TransactionError::MultiplePaymentIds => {
-            panic!("multiple payment IDs despite not supporting integrated addresses");
-          }
-          TransactionError::NoInputs |
-          TransactionError::NoOutputs |
-          TransactionError::InvalidDecoyQuantity |
-          TransactionError::NoChange |
-          TransactionError::TooManyOutputs |
-          TransactionError::TooMuchData |
-          TransactionError::TooLargeTransaction |
-          TransactionError::WrongPrivateKey => {
-            panic!("created an Monero invalid transaction: {e}");
-          }
-          TransactionError::ClsagError(_) |
-          TransactionError::InvalidTransaction(_) |
-          TransactionError::FrostError(_) => {
-            panic!("supposedly unreachable (at this time) Monero error: {e}");
-          }
-          TransactionError::NotEnoughFunds { inputs, outputs, fee } => {
-            if let Some(tx_fee) = tx_fee {
-              panic!(
-                "{}. in: {inputs}, out: {outputs}, fee: {fee}, prior estimated fee: {tx_fee}",
-                "didn't have enough funds for a Monero TX",
-              );
-            } else {
-              Ok(None)
-            }
-          }
-          TransactionError::RpcError(e) => {
-            log::error!("RpcError when preparing transaction: {e:?}");
-            Err(NetworkError::ConnectionError)
-          }
-        },
-      }
-    };
-
-    let tx_fee = match signable(plan.clone(), None)? {
-      Some(tx) => tx.fee(),
-      None => return Ok((None, drop_branches(&plan))),
-    };
-
-    let branch_outputs = amortize_fee(&mut plan, tx_fee);
-
-    let signable = SignableTransaction {
-      transcript,
-      actual: match signable(plan, Some(tx_fee))? {
-        Some(signable) => signable,
-        None => return Ok((None, branch_outputs)),
+  async fn signable_transaction(
+    &self,
+    block_number: usize,
+    plan: &Plan<Self>,
+    fee_rate: Fee,
+  ) -> Result<Option<(Self::SignableTransaction, Self::Eventuality)>, NetworkError> {
+    Ok(self.make_signable_transaction(block_number, plan.clone(), fee_rate, false).await?.map(
+      |(transcript, signable)| {
+        let signable = SignableTransaction { transcript, actual: signable };
+        let eventuality = signable.actual.eventuality().unwrap();
+        (signable, eventuality)
       },
-    };
-    let eventuality = signable.actual.eventuality().unwrap();
-    Ok((Some((signable, eventuality)), branch_outputs))
+    ))
   }
 
   async fn attempt_send(
@@ -573,7 +576,7 @@ impl Network for Monero {
   }
 
   #[cfg(test)]
-  async fn get_fee(&self) -> Self::Fee {
+  async fn get_fee(&self) -> Fee {
     use monero_serai::wallet::FeePriority;
 
     self.rpc.get_fee(self.rpc.get_protocol().await.unwrap(), FeePriority::Low).await.unwrap()

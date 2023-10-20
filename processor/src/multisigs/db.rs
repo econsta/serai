@@ -14,6 +14,7 @@ create_db!(
   MultisigsDb {
     NextBatchDb: () -> u32,
     PlanDb: (id: &[u8]) -> Vec<u8>,
+    OperatingCostsDb: () -> u64,
     ResolvedDb: (tx: &[u8]) -> [u8; 32],
     SigningDb: (key: &[u8]) -> Vec<u8>,
     ForwardedOutputDb: (amount: u64) -> Vec<u8>,
@@ -27,6 +28,7 @@ impl PlanDb {
     key: &[u8],
     block_number: u64,
     plan: &Plan<N>,
+    operating_costs_at_time: u64,
   ) {
     let id = plan.id();
 
@@ -52,7 +54,7 @@ impl PlanDb {
     }
   }
 
-  pub fn active_plans<N: Network>(getter: &impl Get, key: &[u8]) -> Vec<(u64, Plan<N>)> {
+  pub fn active_plans<N: Network>(getter: &impl Get, key: &[u8]) -> Vec<(u64, Plan<N>, u64)> {
     let signing = SigningDb::get(getter, key).unwrap_or(vec![]);
     let mut res = vec![];
 
@@ -64,9 +66,9 @@ impl PlanDb {
       let block_number = u64::from_le_bytes(buf[.. 8].try_into().unwrap());
       let plan = Plan::<N>::read::<&[u8]>(&mut &buf[8 ..]).unwrap();
       assert_eq!(id, &plan.id());
-      res.push((block_number, plan));
+      let operating_costs = u64::from_le_bytes(buf[(buf.len() - 8) ..].try_into().unwrap());
+      res.push((block_number, plan, operating_costs));
     }
-
     res
   }
 
@@ -82,6 +84,18 @@ impl PlanDb {
   }
 }
 
+impl OperatingCostsDb {
+  pub fn take_operating_costs(txn: &mut impl DbTxn) -> u64 {
+    let existing = Self::get(txn).unwrap();
+    txn.del(Self::key());
+    existing
+  }
+  pub fn set_operating_costs(txn: &mut impl DbTxn, amount: u64) {
+    if amount != 0 {
+      Self::set(txn, &amount);
+    }
+  }
+}
 impl ResolvedDb {
   pub fn resolve_plan<N: Network>(
     txn: &mut impl DbTxn,

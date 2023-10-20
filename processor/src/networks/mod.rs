@@ -26,7 +26,7 @@ pub mod monero;
 #[cfg(feature = "monero")]
 pub use monero::Monero;
 
-use crate::{Payment, Plan};
+use crate::Plan;
 
 #[derive(Clone, Copy, Error, Debug)]
 pub enum NetworkError {
@@ -199,7 +199,7 @@ pub struct PostFeeBranch {
 }
 
 // Return the PostFeeBranches needed when dropping a transaction
-pub fn drop_branches<N: Network>(plan: &Plan<N>) -> Vec<PostFeeBranch> {
+fn drop_branches<N: Network>(plan: &Plan<N>) -> Vec<PostFeeBranch> {
   let mut branch_outputs = vec![];
   for payment in &plan.payments {
     if payment.address == N::branch_address(plan.key) {
@@ -209,66 +209,12 @@ pub fn drop_branches<N: Network>(plan: &Plan<N>) -> Vec<PostFeeBranch> {
   branch_outputs
 }
 
-// Amortize a fee over the plan's payments
-pub fn amortize_fee<N: Network>(plan: &mut Plan<N>, tx_fee: u64) -> Vec<PostFeeBranch> {
-  // No payments to amortize over
-  if plan.payments.is_empty() {
-    return vec![];
-  }
-
-  let original_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
-
-  // Amortize the transaction fee across outputs
-  let mut payments_len = u64::try_from(plan.payments.len()).unwrap();
-  // Use a formula which will round up
-  let per_output_fee = |payments| (tx_fee + (payments - 1)) / payments;
-
-  let post_fee = |payment: &Payment<N>, per_output_fee| {
-    let mut post_fee = payment.amount.checked_sub(per_output_fee);
-    // If this is under our dust threshold, drop it
-    if let Some(amount) = post_fee {
-      if amount < N::DUST {
-        post_fee = None;
-      }
-    }
-    post_fee
-  };
-
-  // If we drop outputs for being less than the fee, we won't successfully reduce the amount spent
-  // (dropping a 800 output due to a 1000 fee leaves 200 we still have to deduct)
-  // Do initial runs until the amount of output we will drop is known
-  while {
-    let last = payments_len;
-    payments_len = u64::try_from(
-      plan
-        .payments
-        .iter()
-        .filter(|payment| post_fee(payment, per_output_fee(payments_len)).is_some())
-        .count(),
-    )
-    .unwrap();
-    last != payments_len
-  } {}
-
-  // Now that we know how many outputs will survive, calculate the actual per_output_fee
-  let per_output_fee = per_output_fee(payments_len);
-  let mut branch_outputs = vec![];
-  for payment in plan.payments.iter_mut() {
-    let post_fee = post_fee(payment, per_output_fee);
-    // Note the branch output, if this is one
-    if payment.address == N::branch_address(plan.key) {
-      branch_outputs.push(PostFeeBranch { expected: payment.amount, actual: post_fee });
-    }
-    payment.amount = post_fee.unwrap_or(0);
-  }
-  // Drop payments now worth 0
-  plan.payments = plan.payments.drain(..).filter(|payment| payment.amount != 0).collect();
-
-  // Sanity check the fee wa successfully amortized
-  let new_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
-  assert!((new_outputs + tx_fee) <= original_outputs);
-
-  branch_outputs
+pub struct PreparedSend<N: Network> {
+  /// None for the transaction if the SignableTransaction was dropped due to lack of value.
+  pub tx: Option<(N::SignableTransaction, N::Eventuality)>,
+  pub post_fee_branches: Vec<PostFeeBranch>,
+  /// The updated operating costs after preparing this transaction.
+  pub operating_costs: u64,
 }
 
 #[async_trait]
@@ -278,7 +224,7 @@ pub trait Network: 'static + Send + Sync + Clone + PartialEq + Eq + Debug {
 
   /// The type representing the fee for this network.
   // This should likely be a u64, wrapped in a type which implements appropriate fee logic.
-  type Fee: Copy;
+  type Fee: Send + Copy;
 
   /// The type representing the transaction for this network.
   type Transaction: Transaction<Self>;
@@ -363,19 +309,165 @@ pub trait Network: 'static + Send + Sync + Clone + PartialEq + Eq + Debug {
     block: &Self::Block,
   ) -> HashMap<[u8; 32], (usize, Self::Transaction)>;
 
-  /// Prepare a SignableTransaction for a transaction.
+  /// Returns the needed fee to fulfill this Plan at this fee rate.
   ///
-  /// Returns None for the transaction if the SignableTransaction was dropped due to lack of value.
-  #[rustfmt::skip]
+  /// Returns None if this Plan isn't fulfillable (such as when the fee exceeds the input value).
+  async fn needed_fee(
+    &self,
+    block_number: usize,
+    plan: &Plan<Self>,
+    fee_rate: Self::Fee,
+  ) -> Result<Option<u64>, NetworkError>;
+
+  /// Create a SignableTransaction for the given Plan.
+  ///
+  /// The expected flow is:
+  /// 1) Call needed_fee
+  /// 2) If the Plan is fulfillable, amortize the fee
+  /// 3) Call signable_transaction *which MUST NOT return None if the above was done properly*
+  async fn signable_transaction(
+    &self,
+    block_number: usize,
+    plan: &Plan<Self>,
+    fee_rate: Self::Fee,
+  ) -> Result<Option<(Self::SignableTransaction, Self::Eventuality)>, NetworkError>;
+
+  /// Prepare a SignableTransaction for a transaction.
   async fn prepare_send(
     &self,
     block_number: usize,
-    plan: Plan<Self>,
-    fee: Self::Fee,
-  ) -> Result<
-    (Option<(Self::SignableTransaction, Self::Eventuality)>, Vec<PostFeeBranch>),
-    NetworkError
-  >;
+    mut plan: Plan<Self>,
+    fee_rate: Self::Fee,
+    operating_costs: u64,
+  ) -> Result<PreparedSend<Self>, NetworkError> {
+    // Sanity check this has at least one output planned
+    assert!((!plan.payments.is_empty()) || plan.change.is_some());
+
+    let Some(tx_fee) = self.needed_fee(block_number, &plan, fee_rate).await? else {
+      // This Plan is not fulfillable
+      // TODO: Have Plan explicitly distinguish payments and branches in two separate Vecs?
+      return Ok(PreparedSend {
+        tx: None,
+        // Have all of its branches dropped
+        post_fee_branches: drop_branches(&plan),
+        // This plan expects a change output valued at sum(inputs) - sum(outputs)
+        // Since we can no longer create this change output, it becomes an operating cost
+        // TODO: Look at input restoration to reduce this operating cost
+        operating_costs: operating_costs +
+          if plan.change.is_some() { plan.expected_change() } else { 0 },
+      });
+    };
+
+    // Amortize a fee over the plan's payments
+    let (post_fee_branches, mut operating_costs) = (|| {
+      // If we're creating a change output, letting us recoup coins, amortize the operating costs
+      // as well
+      let total_fee = tx_fee + if plan.change.is_some() { operating_costs } else { 0 };
+
+      let original_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
+      // If this isn't enough for the total fee, drop and move on
+      if original_outputs < total_fee {
+        let mut remaining_operating_costs = operating_costs;
+        if plan.change.is_some() {
+          // Operating costs increase by the TX fee
+          remaining_operating_costs += tx_fee;
+          // Yet decrease by the payments we managed to drop
+          remaining_operating_costs = remaining_operating_costs.saturating_sub(original_outputs);
+        }
+        return (drop_branches(&plan), remaining_operating_costs);
+      }
+
+      let initial_payment_amounts =
+        plan.payments.iter().map(|payment| payment.amount).collect::<Vec<_>>();
+
+      // Amortize the transaction fee across outputs
+      let mut remaining_fee = total_fee;
+      // Run as many times as needed until we can successfully subtract this fee
+      while remaining_fee != 0 {
+        // This shouldn't be a / by 0 as these payments have enough value to cover the fee
+        let this_iter_fee = remaining_fee / u64::try_from(plan.payments.len()).unwrap();
+        let mut overage = remaining_fee % u64::try_from(plan.payments.len()).unwrap();
+        for payment in &mut plan.payments {
+          let this_payment_fee = this_iter_fee + overage;
+          // Only subtract the overage once
+          overage = 0;
+
+          let subtractable = payment.amount.min(this_payment_fee);
+          remaining_fee -= subtractable;
+          payment.amount -= subtractable;
+        }
+      }
+
+      // If any payment is now below the dust threshold, set its value to 0 so it'll be dropped
+      for payment in &mut plan.payments {
+        if payment.amount < Self::DUST {
+          payment.amount = 0;
+        }
+      }
+
+      // Note the branch outputs' new values
+      let mut branch_outputs = vec![];
+      for (initial_amount, payment) in initial_payment_amounts.into_iter().zip(&plan.payments) {
+        if payment.address == Self::branch_address(plan.key) {
+          branch_outputs.push(PostFeeBranch {
+            expected: initial_amount,
+            actual: if payment.amount == 0 { None } else { Some(payment.amount) },
+          });
+        }
+      }
+
+      // Drop payments now worth 0
+      plan.payments = plan.payments.drain(..).filter(|payment| payment.amount != 0).collect();
+
+      // Sanity check the fee wa successfully amortized
+      let new_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
+      assert!((new_outputs + total_fee) <= original_outputs);
+
+      (
+        branch_outputs,
+        if plan.change.is_none() {
+          // If the change is None, this had no effect on the operating costs
+          operating_costs
+        } else {
+          // Since the change is some, and we successfully amortized, the operating costs were
+          // recouped
+          0
+        },
+      )
+    })();
+
+    let Some(tx) = self.signable_transaction(block_number, &plan, fee_rate).await? else {
+      panic!(
+        "{}. post-amortization plan: {:?}, successfully amoritized fee: {}",
+        "signable_transaction returned None for a TX we prior successfully calculated the fee for",
+        &plan,
+        tx_fee,
+      )
+    };
+
+    if plan.change.is_some() {
+      // Now that we've amortized the fee (which may raise the expected change value), grab it
+      // again
+      // Then, subtract the TX fee
+      //
+      // The first `expected_change` call gets the theoretically expected change from the
+      // theoretical Plan object, and accordingly doesn't subtract the fee (expecting the payments
+      // to bare it)
+      // This call wants the actual value, post-amortization over outputs, and since Plan is
+      // unaware of the fee, has to manually adjust
+      let on_chain_expected_change = plan.expected_change() - tx_fee;
+      // If the change value is less than the dust threshold, it becomes an operating cost
+      // This may be slightly inaccurate as dropping payments may reduce the fee, raising the
+      // change above dust
+      // That's fine since it'd have to be in a very precarious state AND then it's over-eager in
+      // tabulating costs
+      if on_chain_expected_change < Self::DUST {
+        operating_costs += on_chain_expected_change;
+      }
+    }
+
+    Ok(PreparedSend { tx: Some(tx), post_fee_branches, operating_costs })
+  }
 
   /// Attempt to sign a SignableTransaction.
   async fn attempt_send(
