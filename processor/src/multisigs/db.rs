@@ -33,7 +33,7 @@ impl PlanDb {
     let id = plan.id();
 
     {
-      let mut signing = SigningDb::get(txn, key).unwrap_or(vec![]);
+      let mut signing = SigningDb::get(txn, key).unwrap_or_default();
 
       // If we've already noted we're signing this, return
       assert_eq!(signing.len() % 32, 0);
@@ -56,7 +56,7 @@ impl PlanDb {
   }
 
   pub fn active_plans<N: Network>(getter: &impl Get, key: &[u8]) -> Vec<(u64, Plan<N>, u64)> {
-    let signing = SigningDb::get(getter, key).unwrap_or(vec![]);
+    let signing = SigningDb::get(getter, key).unwrap_or_default();
     let mut res = vec![];
 
     assert_eq!(signing.len() % 32, 0);
@@ -104,7 +104,7 @@ impl ResolvedDb {
     plan: [u8; 32],
     resolution: <N::Transaction as Transaction<N>>::Id,
   ) {
-    let mut signing = SigningDb::get(txn, key).unwrap_or(vec![]);
+    let mut signing = SigningDb::get(txn, key).unwrap_or_default();
     assert_eq!(signing.len() % 32, 0);
 
     let mut found = false;
@@ -155,7 +155,7 @@ impl ForwardedOutputDb {
 
 impl DelayedOutputDb {
   pub fn save_delayed_output(txn: &mut impl DbTxn, instruction: InInstructionWithBalance) {
-    let mut existing = Self::get(txn).unwrap_or(vec![]);
+    let mut existing = Self::get(txn).unwrap_or_default();
     existing.extend(instruction.encode());
     Self::set(txn, &existing);
   }

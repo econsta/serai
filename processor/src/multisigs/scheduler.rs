@@ -379,7 +379,7 @@ impl<N: Network> Scheduler<N> {
         change: Some(N::change_address(key_for_any_change)),
       });
     }
-    SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
+    SchedulerDb::set(txn, self.key.to_bytes().as_ref(), &self.serialize());
 
     log::info!(
       "created {} plans containing {} payments to sign",
@@ -392,7 +392,7 @@ impl<N: Network> Scheduler<N> {
   pub fn consume_payments<D: Db>(&mut self, txn: &mut D::Transaction<'_>) -> Vec<Payment<N>> {
     let res: Vec<_> = self.payments.drain(..).collect();
     if !res.is_empty() {
-      SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
+      SchedulerDb::set(txn, self.key.to_bytes().as_ref(), &self.serialize());
     }
     res
   }
@@ -464,6 +464,6 @@ impl<N: Network> Scheduler<N> {
     self.plans.entry(actual).or_insert(VecDeque::new()).push_back(payments);
 
     // TODO2: This shows how ridiculous the serialize function is
-    SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
+    SchedulerDb::set(txn, self.key.to_bytes().as_ref(), &self.serialize());
   }
 }

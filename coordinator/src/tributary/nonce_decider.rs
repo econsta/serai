@@ -1,8 +1,10 @@
 use core::marker::PhantomData;
 
-use serai_db::{Get, DbTxn, Db};
+use serai_db::{Get, DbTxn, Db, create_db};
 
 use crate::tributary::Transaction;
+
+use scale::Encode;
 
 /// Decides the nonce which should be used for a transaction on a Tributary.
 ///
@@ -15,25 +17,22 @@ const BATCH_SIGNING_CODE: u8 = 1;
 const PLAN_CODE: u8 = 2;
 const PLAN_SIGNING_CODE: u8 = 3;
 
-impl<D: Db> NonceDecider<D> {
-  fn next_nonce_key(genesis: [u8; 32]) -> Vec<u8> {
-    D::key(b"coordinator_tributary_nonce", b"next", genesis)
+create_db!(
+  CoordinatorTributaryDb {
+    NextNonceDb: (genesis: &[u8]) -> u32,
+    ItemNonceDb: (genesis: &[u8], code: &[u8], id: &[u8]) -> u32
   }
-  fn allocate_nonce(txn: &mut D::Transaction<'_>, genesis: [u8; 32]) -> u32 {
-    let key = Self::next_nonce_key(genesis);
-    let next =
-      txn.get(&key).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).unwrap_or(3);
-    txn.put(key, (next + 1).to_le_bytes());
+);
+
+
+
+impl<D: Db> NonceDecider<D> {
+  fn allocate_nonce(txn: &mut impl DbTxn, genesis: [u8; 32]) -> u32 {
+    let next = NextNonceDb::get(txn, &genesis).unwrap_or(3);
+    NextNonceDb::set(txn, &genesis, &(next + 1));
     next
   }
-
-  fn item_nonce_key(genesis: [u8; 32], code: u8, id: [u8; 32]) -> Vec<u8> {
-    D::key(
-      b"coordinator_tributary_nonce",
-      b"item",
-      [genesis.as_slice(), [code].as_ref(), id.as_ref()].concat(),
-    )
-  }
+  
   fn set_nonce(
     txn: &mut D::Transaction<'_>,
     genesis: [u8; 32],
@@ -41,12 +40,11 @@ impl<D: Db> NonceDecider<D> {
     id: [u8; 32],
     nonce: u32,
   ) {
-    txn.put(Self::item_nonce_key(genesis, code, id), nonce.to_le_bytes())
+    ItemNonceDb::set(txn, &genesis, [code].as_ref(), &id, &nonce);
   }
-  fn db_nonce<G: Get>(getter: &G, genesis: [u8; 32], code: u8, id: [u8; 32]) -> Option<u32> {
-    getter
-      .get(Self::item_nonce_key(genesis, code, id))
-      .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+
+  fn db_nonce(getter: &impl Get, genesis: [u8; 32], code: u8, id: [u8; 32]) -> Option<u32> {
+    ItemNonceDb::get(getter, &genesis, [code].as_ref(), &id)
   }
 
   pub fn handle_batch(txn: &mut D::Transaction<'_>, genesis: [u8; 32], batch: [u8; 32]) -> u32 {

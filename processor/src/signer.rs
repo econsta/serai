@@ -42,7 +42,7 @@ impl CompletedDb {
   ) {
     // Transactions can be completed by multiple signatures
     // Save every solution in order to be robust
-    let mut existing = Self::get(txn, id).unwrap_or(vec![]);
+    let mut existing = Self::get(txn, id).unwrap_or_default();
 
     // Don't add this TX if it's already present
     let tx_len = tx.as_ref().len();
@@ -75,7 +75,7 @@ impl EventualityDb {
 
 impl TransactionDb {
   fn save_transaction<N: Network>(txn: &mut impl DbTxn, tx: &N::Transaction) {
-    Self::set(txn, &tx.id().as_ref(), &tx.serialize());
+    Self::set(txn, tx.id().as_ref(), &tx.serialize());
   }
 }
 
