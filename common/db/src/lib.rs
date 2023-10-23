@@ -24,10 +24,6 @@ pub trait DbTxn: Send + Get {
 /// A database supporting atomic operations.
 pub trait Db: 'static + Send + Sync + Clone + Get {
   type Transaction<'a>: DbTxn;
-  fn key(db_dst: &'static [u8], item_dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    let db_len = u8::try_from(db_dst.len()).unwrap();
-    let dst_len = u8::try_from(item_dst.len()).unwrap();
-    [[db_len].as_ref(), db_dst, [dst_len].as_ref(), item_dst, key.as_ref()].concat()
-  }
+  
   fn txn(&mut self) -> Self::Transaction<'_>;
 }
