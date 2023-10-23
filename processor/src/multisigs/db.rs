@@ -49,6 +49,7 @@ impl PlanDb {
 
     {
       let mut buf = block_number.to_le_bytes().to_vec();
+      buf.extend(&operating_costs_at_time.to_le_bytes());
       plan.write(&mut buf).unwrap();
       Self::set(txn, &id, &buf);
     }
