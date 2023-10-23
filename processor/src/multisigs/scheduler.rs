@@ -4,7 +4,8 @@ use std::{
 };
 
 use ciphersuite::{group::GroupEncoding, Ciphersuite};
-
+use serai_db::{create_db, Get};
+use scale::Encode;
 use crate::{
   networks::{OutputType, Output, Network},
   DbTxn, Db, Payment, Plan,
@@ -39,9 +40,11 @@ pub struct Scheduler<N: Network> {
   payments: VecDeque<Payment<N>>,
 }
 
-fn scheduler_key<D: Db, G: GroupEncoding>(key: &G) -> Vec<u8> {
-  D::key(b"SCHEDULER", b"scheduler", key.to_bytes())
-}
+create_db!(
+  SchedulerDb {
+    SchedulerDb:  (key: &[u8])  -> Vec<u8>
+  }
+);
 
 impl<N: Network> Scheduler<N> {
   pub fn empty(&self) -> bool {
@@ -143,12 +146,12 @@ impl<N: Network> Scheduler<N> {
       payments: VecDeque::new(),
     };
     // Save it to disk so from_db won't panic if we don't mutate it before rebooting
-    txn.put(scheduler_key::<D, _>(&res.key), res.serialize());
+    SchedulerDb::set(txn, key.to_bytes().as_ref(), &res.serialize());
     res
   }
 
   pub fn from_db<D: Db>(db: &D, key: <N::Curve as Ciphersuite>::G) -> io::Result<Self> {
-    let scheduler = db.get(scheduler_key::<D, _>(&key)).unwrap_or_else(|| {
+    let scheduler = SchedulerDb::get(db, key.to_bytes().as_ref()).unwrap_or_else(|| {
       panic!("loading scheduler from DB without scheduler for {}", hex::encode(key.to_bytes()))
     });
     let mut reader_slice = scheduler.as_slice();
@@ -376,8 +379,7 @@ impl<N: Network> Scheduler<N> {
         change: Some(N::change_address(key_for_any_change)),
       });
     }
-
-    txn.put(scheduler_key::<D, _>(&self.key), self.serialize());
+    SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
 
     log::info!(
       "created {} plans containing {} payments to sign",
@@ -390,7 +392,7 @@ impl<N: Network> Scheduler<N> {
   pub fn consume_payments<D: Db>(&mut self, txn: &mut D::Transaction<'_>) -> Vec<Payment<N>> {
     let res: Vec<_> = self.payments.drain(..).collect();
     if !res.is_empty() {
-      txn.put(scheduler_key::<D, _>(&self.key), self.serialize());
+      SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
     }
     res
   }
@@ -462,6 +464,6 @@ impl<N: Network> Scheduler<N> {
     self.plans.entry(actual).or_insert(VecDeque::new()).push_back(payments);
 
     // TODO2: This shows how ridiculous the serialize function is
-    txn.put(scheduler_key::<D, _>(&self.key), self.serialize());
+    SchedulerDb::set(txn, &self.key.to_bytes().as_ref(), &self.serialize());
   }
 }
