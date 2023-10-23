@@ -13,6 +13,7 @@ use log::{info, debug, warn, error};
 
 use scale::Encode;
 use messages::sign::*;
+use serai_db::create_db;
 use crate::{
   Get, DbTxn, Db,
   networks::{Transaction, Eventuality, Network},
@@ -24,24 +25,24 @@ pub enum SignerEvent<N: Network> {
   ProcessorMessage(ProcessorMessage),
 }
 
-#[derive(Debug)]
-struct SignerDb<N: Network, D: Db>(D, PhantomData<N>);
-impl<N: Network, D: Db> SignerDb<N, D> {
-  fn sign_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    D::key(b"SIGNER", dst, key)
+create_db!(
+  SignerDb {
+    CompletedDb: (id: [u8; 32]) -> Vec<u8>,
+    EventualityDb: (id: [u8; 32]) -> Vec<u8>,
+    AttemptDb: (id: &SignId) -> [u8; 0],
+    TransactionDb: (id: &[u8]) -> Vec<u8>
   }
+);
 
-  fn completed_key(id: [u8; 32]) -> Vec<u8> {
-    Self::sign_key(b"completed", id)
-  }
-  fn complete(
-    txn: &mut D::Transaction<'_>,
+impl CompletedDb {
+  fn complete<N: Network>(
+    txn: &mut impl DbTxn,
     id: [u8; 32],
     tx: &<N::Transaction as Transaction<N>>::Id,
   ) {
     // Transactions can be completed by multiple signatures
     // Save every solution in order to be robust
-    let mut existing = txn.get(Self::completed_key(id)).unwrap_or(vec![]);
+    let mut existing = Self::get(txn, id).unwrap_or(vec![]);
 
     // Don't add this TX if it's already present
     let tx_len = tx.as_ref().len();
@@ -56,36 +57,25 @@ impl<N: Network, D: Db> SignerDb<N, D> {
     }
 
     existing.extend(tx.as_ref());
-    txn.put(Self::completed_key(id), existing);
+    Self::set(txn, id, &existing);
   }
-  fn completed<G: Get>(getter: &G, id: [u8; 32]) -> Option<Vec<u8>> {
-    getter.get(Self::completed_key(id))
+}
+
+impl EventualityDb {
+  fn save_eventuality<N: Network>(txn: &mut impl DbTxn, id: [u8; 32], eventuality: N::Eventuality) {
+    txn.put(Self::key(id), eventuality.serialize());
   }
 
-  fn eventuality_key(id: [u8; 32]) -> Vec<u8> {
-    Self::sign_key(b"eventuality", id)
-  }
-  fn save_eventuality(txn: &mut D::Transaction<'_>, id: [u8; 32], eventuality: N::Eventuality) {
-    txn.put(Self::eventuality_key(id), eventuality.serialize());
-  }
-  fn eventuality<G: Get>(getter: &G, id: [u8; 32]) -> Option<N::Eventuality> {
+  fn eventuality<N: Network>(getter: &impl Get, id: [u8; 32]) -> Option<N::Eventuality> {
     Some(
-      N::Eventuality::read::<&[u8]>(&mut getter.get(Self::eventuality_key(id))?.as_ref()).unwrap(),
+      N::Eventuality::read::<&[u8]>(&mut getter.get(Self::key(id))?.as_ref()).unwrap(),
     )
   }
+}
 
-  fn attempt_key(id: &SignId) -> Vec<u8> {
-    Self::sign_key(b"attempt", id.encode())
-  }
-  fn attempt(txn: &mut D::Transaction<'_>, id: &SignId) {
-    txn.put(Self::attempt_key(id), []);
-  }
-  fn has_attempt<G: Get>(getter: &G, id: &SignId) -> bool {
-    getter.get(Self::attempt_key(id)).is_some()
-  }
-
-  fn save_transaction(txn: &mut D::Transaction<'_>, tx: &N::Transaction) {
-    txn.put(Self::sign_key(b"tx", tx.id()), tx.serialize());
+impl TransactionDb {
+  fn save_transaction<N: Network>(txn: &mut impl DbTxn, tx: &N::Transaction) {
+    Self::set(txn, &tx.id().as_ref(), &tx.serialize());
   }
 }
 
@@ -170,7 +160,7 @@ impl<N: Network, D: Db> Signer<N, D> {
   }
 
   fn already_completed(&self, txn: &mut D::Transaction<'_>, id: [u8; 32]) -> bool {
-    if SignerDb::<N, D>::completed(txn, id).is_some() {
+    if CompletedDb::get(txn, id).is_some() {
       debug!(
         "SignTransaction/Reattempt order for {}, which we've already completed signing",
         hex::encode(id)
@@ -202,8 +192,8 @@ impl<N: Network, D: Db> Signer<N, D> {
     let first_completion = !self.already_completed(txn, id);
 
     // Save this completion to the DB
-    SignerDb::<N, D>::save_transaction(txn, &tx);
-    SignerDb::<N, D>::complete(txn, id, &tx.id());
+    TransactionDb::save_transaction::<N>(txn, &tx);
+    CompletedDb::complete::<N>(txn, id, &tx.id());
 
     if first_completion {
       self.complete(id, tx.id());
@@ -217,7 +207,7 @@ impl<N: Network, D: Db> Signer<N, D> {
     id: [u8; 32],
     tx_id: &<N::Transaction as Transaction<N>>::Id,
   ) -> bool {
-    if let Some(eventuality) = SignerDb::<N, D>::eventuality(txn, id) {
+    if let Some(eventuality) = EventualityDb::eventuality::<N>(txn, id) {
       // Transaction hasn't hit our mempool/was dropped for a different signature
       // The latter can happen given certain latency conditions/a single malicious signer
       // In the case of a single malicious signer, they can drag multiple honest validators down
@@ -238,8 +228,8 @@ impl<N: Network, D: Db> Signer<N, D> {
         let first_completion = !self.already_completed(txn, id);
 
         // Save this completion to the DB
-        SignerDb::<N, D>::save_transaction(txn, &tx);
-        SignerDb::<N, D>::complete(txn, id, tx_id);
+        TransactionDb::save_transaction::<N>(txn, &tx);
+        CompletedDb::complete::<N>(txn, id, tx_id);
 
         if first_completion {
           self.complete(id, tx.id());
@@ -255,7 +245,7 @@ impl<N: Network, D: Db> Signer<N, D> {
     } else {
       // If we don't have this in RAM, it should be because we already finished signing it
       // TODO: Will the coordinator ever send us Completed for an unknown ID?
-      assert!(SignerDb::<N, D>::completed(txn, id).is_some());
+      assert!(CompletedDb::get(txn, id).is_some());
       info!(
         "signer {} informed of the eventuality completion for plan {}, {}",
         hex::encode(self.keys.group_key().to_bytes()),
@@ -315,7 +305,7 @@ impl<N: Network, D: Db> Signer<N, D> {
     // branch again for something we've already attempted
     //
     // Only run if this hasn't already been attempted
-    if SignerDb::<N, D>::has_attempt(txn, &id) {
+    if AttemptDb::get(txn, &id).is_some() {
       warn!(
         "already attempted {} #{}. this is an error if we didn't reboot",
         hex::encode(id.id),
@@ -324,7 +314,7 @@ impl<N: Network, D: Db> Signer<N, D> {
       return;
     }
 
-    SignerDb::<N, D>::attempt(txn, &id);
+    AttemptDb::set(txn, &id, &[] as &[u8; 0]);
 
     // Attempt to create the TX
     let machine = match self.network.attempt_send(self.keys.clone(), tx).await {
@@ -360,7 +350,7 @@ impl<N: Network, D: Db> Signer<N, D> {
       return;
     }
 
-    SignerDb::<N, D>::save_eventuality(txn, id, eventuality);
+    EventualityDb::save_eventuality::<N>(txn, id, eventuality);
 
     self.signable.insert(id, tx);
     self.attempt(txn, id, 0).await;
@@ -462,9 +452,9 @@ impl<N: Network, D: Db> Signer<N, D> {
         };
 
         // Save the transaction in case it's needed for recovery
-        SignerDb::<N, D>::save_transaction(txn, &tx);
+        TransactionDb::save_transaction::<N>(txn, &tx);
         let tx_id = tx.id();
-        SignerDb::<N, D>::complete(txn, id.id, &tx_id);
+        CompletedDb::complete::<N>(txn, id.id, &tx_id);
 
         // Publish it
         if let Err(e) = self.network.publish_transaction(&tx).await {
