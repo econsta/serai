@@ -42,33 +42,6 @@ create_db!(
 );
 
 impl<D: Db, T: Transaction> ProvidedTransactions<D, T> {
-  // fn transaction_key(&self, hash: &[u8]) -> Vec<u8> {
-  //   D::key(b"tributary_provided", b"transaction", [self.genesis.as_ref(), hash].concat())
-  // }
-  // fn current_provided_key(&self) -> Vec<u8> {
-  //   D::key(b"tributary_provided", b"current", self.genesis)
-  // }
-  // pub(crate) fn locally_provided_quantity_key(genesis: &[u8; 32], order: &str) -> Vec<u8> {
-  //   D::key(b"tributary_provided", b"local_quantity", [genesis, order.as_bytes()].concat())
-  // }
-  // pub(crate) fn on_chain_provided_quantity_key(genesis: &[u8; 32], order: &str) -> Vec<u8> {
-  //   D::key(b"tributary_provided", b"on_chain_quantity", [genesis, order.as_bytes()].concat())
-  // }
-  // pub(crate) fn block_provided_quantity_key(
-  //   genesis: &[u8; 32],
-  //   block: &[u8; 32],
-  //   order: &str,
-  // ) -> Vec<u8> {
-  //   D::key(b"tributary_provided", b"block_quantity", [genesis, block, order.as_bytes()].concat())
-  // }
-
-  // pub(crate) fn on_chain_provided_key(genesis: &[u8; 32], order: &str, id: u32) -> Vec<u8> {
-  //   D::key(
-  //     b"tributary_provided",
-  //     b"on_chain_tx",
-  //     [genesis, order.as_bytes(), &id.to_le_bytes()].concat(),
-  //   )
-  // }
 
   pub(crate) fn new(db: D, genesis: [u8; 32]) -> Self {
     let mut res = ProvidedTransactions { db, genesis, transactions: HashMap::new() };
