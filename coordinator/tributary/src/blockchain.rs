@@ -9,7 +9,7 @@ use scale::{Encode, Decode};
 use tendermint::ext::{Network, Commit};
 
 use crate::{
-  ReadWrite, ProvidedError, ProvidedTransactions, BlockError, Block, Mempool, Transaction,
+  ReadWrite, ProvidedError, ProvidedTransactions, BlockQuantityDb, LocalQuantityDb, BlockError, Block, Mempool, Transaction,
   transaction::{Signed, TransactionKind, TransactionError, Transaction as TransactionTrait},
 };
 
@@ -127,14 +127,9 @@ impl<D: Db, T: TransactionTrait> Blockchain<D, T> {
     block: &[u8; 32],
     order: &str,
   ) -> bool {
-    let local_key = ProvidedTransactions::<D, T>::locally_provided_quantity_key(genesis, order);
-    let local =
-      db.get(local_key).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).unwrap_or(0);
-    let block_key =
-      ProvidedTransactions::<D, T>::block_provided_quantity_key(genesis, block, order);
-    let block =
-      db.get(block_key).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).unwrap_or(0);
-
+    let order_bytes = order.as_bytes();
+    let local = LocalQuantityDb::get(db, genesis, order_bytes).unwrap_or_default();
+    let block = BlockQuantityDb::get(db, genesis, block, order_bytes).unwrap_or_default();
     local >= block
   }
 
