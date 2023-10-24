@@ -30,33 +30,75 @@ create_db!(
     CompletedDb: (id: [u8; 32]) -> Vec<u8>,
     EventualityDb: (id: [u8; 32]) -> Vec<u8>,
     AttemptDb: (id: &SignId) -> [u8; 0],
-    TransactionDb: (id: &[u8]) -> Vec<u8>
+    TransactionDb: (id: &[u8]) -> Vec<u8>,
+    ActiveSignsDb: () -> Vec<[u8; 32]>,
+    CompletedOnChainDb: (id: &[u8; 32]) -> Vec<[u8; 32]>
   }
 );
 
+impl ActiveSignsDb {
+  fn add_active_sign(txn: &mut impl DbTxn, id: &[u8; 32]) {
+    if CompletedOnChainDb::get(txn, id).is_some() {
+      return;
+    }
+    let mut active = ActiveSignsDb::get(txn).unwrap_or_default();
+    active.push(*id);
+    ActiveSignsDb::set(txn, &active);
+  }
+}
+
+impl CompletedOnChainDb {
+  fn complete_on_chain(txn: &mut impl DbTxn, id: &[u8; 32]) {
+    CompletedOnChainDb::set(txn, id, &vec![] as &Vec<[u8; 32]>);
+    ActiveSignsDb::set(
+      txn,
+      &ActiveSignsDb::get(txn)
+        .unwrap()
+        .into_iter()
+        .filter(|active| active != id)
+        .flatten()
+        .collect::<Vec<_>>(),
+    );
+  }
+}
 impl CompletedDb {
+  fn completions<N: Network>(getter: &impl Get, id: [u8; 32]) -> Vec<<N::Transaction as Transaction<N>>::Id> {
+    let completions = Self::get(getter, id).unwrap_or(vec![]);
+    let mut completions_ref = completions.as_slice();
+    let mut res = vec![];
+    while !completions_ref.is_empty() {
+      let mut id = <N::Transaction as Transaction<N>>::Id::default();
+      let id_len = id.as_ref().len();
+      id.as_mut().copy_from_slice(&completions_ref[.. id_len]);
+      completions_ref = &completions_ref[id_len ..];
+      res.push(id);
+    }
+    res
+  }
+  
   fn complete<N: Network>(
     txn: &mut impl DbTxn,
     id: [u8; 32],
-    tx: &<N::Transaction as Transaction<N>>::Id,
+    tx: &N::Transaction,
   ) {
+    let tx_id = tx.id();
     // Transactions can be completed by multiple signatures
     // Save every solution in order to be robust
-    let mut existing = Self::get(txn, id).unwrap_or_default();
-
+    TransactionDb::save_transaction::<N>(txn, tx);
+    let mut existing = Self::get(txn, id).unwrap_or(vec![]);
     // Don't add this TX if it's already present
-    let tx_len = tx.as_ref().len();
+    let tx_len = tx_id.as_ref().len();
     assert_eq!(existing.len() % tx_len, 0);
 
     let mut i = 0;
     while i < existing.len() {
-      if &existing[i .. (i + tx_len)] == tx.as_ref() {
+      if &existing[i .. (i + tx_len)] == tx_id.as_ref() {
         return;
       }
       i += tx_len;
     }
 
-    existing.extend(tx.as_ref());
+    existing.extend(tx_id.as_ref());
     Self::set(txn, id, &existing);
   }
 }
@@ -76,6 +118,13 @@ impl EventualityDb {
 impl TransactionDb {
   fn save_transaction<N: Network>(txn: &mut impl DbTxn, tx: &N::Transaction) {
     Self::set(txn, tx.id().as_ref(), &tx.serialize());
+  }
+
+  fn transaction<N: Network>(
+    getter: &impl Get,
+    id: <N::Transaction as Transaction<N>>::Id,
+  ) -> Option<N::Transaction> {
+    Self::get(getter, id.as_ref()).map(|tx| N::Transaction::read(&mut tx.as_slice()).unwrap())
   }
 }
 
@@ -112,6 +161,25 @@ impl<N: Network, D: Db> fmt::Debug for Signer<N, D> {
 }
 
 impl<N: Network, D: Db> Signer<N, D> {
+  /// Rebroadcast already signed TXs which haven't had their completions mined into a sufficiently
+  /// confirmed block.
+  pub async fn rebroadcast_task(db: D, network: N) {
+    log::info!("rebroadcasting transactions for plans whose completions yet to be confirmed...");
+    loop {
+      for active in ActiveSignsDb::get(&db).unwrap() {
+        for completion in CompletedDb::completions::<N>(&db, active) {
+          log::info!("rebroadcasting {}", hex::encode(&completion));
+          // TODO: Don't drop the error entirely. Check for invariants
+          let _ = network
+            .publish_transaction(&TransactionDb::transaction::<N>(&db, completion).unwrap())
+            .await;
+        }
+      }
+      // Only run every five minutes so we aren't frequently loading tens to hundreds of KB from
+      // the DB
+      tokio::time::sleep(core::time::Duration::from_secs(5 * 60)).await;
+    }
+  }
   pub fn new(network: N, keys: ThresholdKeys<N::Curve>) -> Signer<N, D> {
     Signer {
       db: PhantomData,
@@ -192,8 +260,8 @@ impl<N: Network, D: Db> Signer<N, D> {
     let first_completion = !self.already_completed(txn, id);
 
     // Save this completion to the DB
-    TransactionDb::save_transaction::<N>(txn, &tx);
-    CompletedDb::complete::<N>(txn, id, &tx.id());
+    CompletedOnChainDb::complete_on_chain(txn, &id);
+    CompletedDb::complete::<N>(txn, id, &tx);
 
     if first_completion {
       self.complete(id, tx.id());
@@ -228,8 +296,7 @@ impl<N: Network, D: Db> Signer<N, D> {
         let first_completion = !self.already_completed(txn, id);
 
         // Save this completion to the DB
-        TransactionDb::save_transaction::<N>(txn, &tx);
-        CompletedDb::complete::<N>(txn, id, tx_id);
+        CompletedDb::complete::<N>(txn, id, &tx);
 
         if first_completion {
           self.complete(id, tx.id());
@@ -346,6 +413,10 @@ impl<N: Network, D: Db> Signer<N, D> {
     tx: N::SignableTransaction,
     eventuality: N::Eventuality,
   ) {
+    // The caller is expected to re-issue sign orders on reboot
+    // This is solely used by the rebroadcast task
+    ActiveSignsDb::set(txn, &id);
+
     if self.already_completed(txn, id) {
       return;
     }
@@ -452,11 +523,11 @@ impl<N: Network, D: Db> Signer<N, D> {
         };
 
         // Save the transaction in case it's needed for recovery
-        TransactionDb::save_transaction::<N>(txn, &tx);
         let tx_id = tx.id();
-        CompletedDb::complete::<N>(txn, id.id, &tx_id);
+        CompletedDb::complete::<N>(txn, id.id, &tx);
 
         // Publish it
+        let tx_id = tx.id();
         if let Err(e) = self.network.publish_transaction(&tx).await {
           error!("couldn't publish {:?}: {:?}", tx, e);
         } else {

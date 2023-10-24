@@ -2,7 +2,7 @@ use std::{time::Duration, io, collections::HashMap};
 
 use async_trait::async_trait;
 
-use transcript::RecommendedTranscript;
+use transcript::{Transcript, RecommendedTranscript};
 use ciphersuite::group::ff::PrimeField;
 use k256::{ProjectivePoint, Scalar};
 use frost::{
@@ -49,7 +49,7 @@ use crate::{
     Transaction as TransactionTrait, SignableTransaction as SignableTransactionTrait,
     Eventuality as EventualityTrait, EventualitiesTracker, Network,
   },
-  Plan,
+  Payment,
 };
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -163,6 +163,11 @@ impl TransactionTrait<Bitcoin> for Transaction {
     self.consensus_encode(&mut buf).unwrap();
     buf
   }
+  fn read<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+    Transaction::consensus_decode(reader)
+      .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))
+  }
+
   #[cfg(test)]
   async fn fee(&self, network: &Bitcoin) -> u64 {
     let mut value = 0;
@@ -249,11 +254,6 @@ impl BlockTrait<Bitcoin> for Block {
   fn time(&self) -> u64 {
     self.header.time.into()
   }
-
-  fn median_fee(&self) -> Fee {
-    // TODO
-    Fee(20)
-  }
 }
 
 const KEY_DST: &[u8] = b"Serai Bitcoin Output Offset";
@@ -320,46 +320,82 @@ impl Bitcoin {
     }
   }
 
+  // This function panics on a node which doesn't follow the Bitcoin protocol, which is deemed fine
+  async fn median_fee(&self, block: &Block) -> Result<Fee, NetworkError> {
+    let mut fees = vec![];
+    if block.txdata.len() > 1 {
+      for tx in &block.txdata[1 ..] {
+        let mut in_value = 0;
+        for input in &tx.input {
+          let mut input_tx = input.previous_output.txid.to_raw_hash().to_byte_array();
+          input_tx.reverse();
+          in_value += self.get_transaction(&input_tx).await?.output
+            [usize::try_from(input.previous_output.vout).unwrap()]
+          .value;
+        }
+        let out = tx.output.iter().map(|output| output.value).sum::<u64>();
+        fees.push((in_value - out) / tx.weight().to_wu());
+      }
+    }
+    fees.sort();
+    let fee = fees.get(fees.len() / 2).cloned().unwrap_or(0);
+
+    // The DUST constant documentation notes a relay rule practically enforcing a
+    // 1000 sat/kilo-vbyte minimum fee.
+    //
+    // 1000 sat/kilo-vbyte is 1000 sat/4-kilo-weight (250 sat/kilo-weight).
+    // Since bitcoin-serai takes fee per weight, we'd need to pass 0.25 to achieve this fee rate.
+    // Accordingly, setting 1 is 4x the current relay rule minimum (and should be more than safe).
+    // TODO: Rewrite to fee_per_vbyte, not fee_per_weight?
+    Ok(Fee(fee.max(1)))
+  }
+
   async fn make_signable_transaction(
     &self,
-    plan: &Plan<Self>,
-    fee: Fee,
+    block_number: usize,
+    inputs: &[Output],
+    payments: &[Payment<Self>],
+    change: &Option<Address>,
     calculating_fee: bool,
-  ) -> Option<BSignableTransaction> {
-    let mut payments = vec![];
-    for payment in &plan.payments {
-      // If we're solely estimating the fee, don't specify the actual amount
-      // This won't affect the fee calculation yet will ensure we don't hit a not enough funds
-      // error
-      payments.push((
-        payment.address.0.clone(),
-        if calculating_fee { Self::DUST } else { payment.amount },
-      ));
-    }
+  ) -> Result<Option<BSignableTransaction>, NetworkError> {
+    // TODO2: Use an fee representative of several blocks, cached inside Self
+    let block_for_fee = self.get_block(block_number).await?;
+    let fee = self.median_fee(&block_for_fee).await?;
+
+    let payments = payments
+      .iter()
+      .map(|payment| {
+        (
+          payment.address.0.clone(),
+          // If we're solely estimating the fee, don't specify the actual amount
+          // This won't affect the fee calculation yet will ensure we don't hit a not enough funds
+          // error
+          if calculating_fee { Self::DUST } else { payment.amount },
+        )
+      })
+      .collect::<Vec<_>>();
 
     match BSignableTransaction::new(
-      plan.inputs.iter().map(|input| input.output.clone()).collect(),
+      inputs.iter().map(|input| input.output.clone()).collect(),
       &payments,
-      plan.change.as_ref().map(|change| change.0.clone()),
+      change.as_ref().map(|change| change.0.clone()),
       None,
       fee.0,
     ) {
-      Ok(signable) => Some(signable),
+      Ok(signable) => Ok(Some(signable)),
       Err(TransactionError::NoInputs) => {
         panic!("trying to create a bitcoin transaction without inputs")
       }
       // No outputs left and the change isn't worth enough
-      Err(TransactionError::NoOutputs) => None,
+      Err(TransactionError::NoOutputs) => Ok(None),
       // amortize_fee removes payments which fall below the dust threshold
       Err(TransactionError::DustPayment) => panic!("dust payment despite removing dust"),
       Err(TransactionError::TooMuchData) => panic!("too much data despite not specifying data"),
       Err(TransactionError::TooLowFee) => {
         panic!("created a transaction whose fee is below the minimum")
       }
-      Err(TransactionError::NotEnoughFunds) => {
-        // Mot even enough funds to pay the fee
-        None
-      }
+      // Mot even enough funds to pay the fee
+      Err(TransactionError::NotEnoughFunds) => Ok(None),
       Err(TransactionError::TooLargeTransaction) => {
         panic!("created a too large transaction despite limiting inputs/outputs")
       }
@@ -371,7 +407,6 @@ impl Bitcoin {
 impl Network for Bitcoin {
   type Curve = Secp256k1;
 
-  type Fee = Fee;
   type Transaction = Transaction;
   type Block = Block;
 
@@ -387,9 +422,47 @@ impl Network for Bitcoin {
   const ESTIMATED_BLOCK_TIME_IN_SECONDS: usize = 600;
   const CONFIRMATIONS: usize = 6;
 
-  // 0.0001 BTC, 10,000 satoshis
-  #[allow(clippy::inconsistent_digit_grouping)]
-  const DUST: u64 = 1_00_000_000 / 10_000;
+  /*
+    A Taproot input is:
+    - 36 bytes for the OutPoint
+    - 0 bytes for the script (+1 byte for the length)
+    - 4 bytes for the sequence
+    Per https://developer.bitcoin.org/reference/transactions.html#raw-transaction-format
+
+    There's also:
+    - 1 byte for the witness length
+    - 1 byte for the signature length
+    - 64 bytes for the signature
+    which have the SegWit discount.
+
+    (4 * (36 + 1 + 4)) + (1 + 1 + 64) = 164 + 66 = 230 weight units
+    230 ceil div 4 = 57 vbytes
+
+    Bitcoin defines multiple minimum feerate constants *per kilo-vbyte*. Currently, these are:
+    - 1000 sat/kilo-vbyte for a transaction to be relayed
+    - Each output's value must exceed the fee of the TX spending it at 3000 sat/kilo-vbyte
+    The DUST constant needs to be determined by the latter.
+    Since these are solely relay rules, and may be raised, we require all outputs be spendable
+    under a 5000 sat/kilo-vbyte fee rate.
+
+    5000 sat/kilo-vbyte = 5 sat/vbyte
+    5 * 57 = 285 sats/spent-output
+
+    Even if an output took 100 bytes (it should be just ~29-43), taking 400 weight units, adding
+    100 vbytes, tripling the transaction size, then the sats/tx would be < 1000.
+
+    Increase by an order of magnitude, in order to ensure this is actually worth our time, and we
+    get 10,000 satoshis.
+  */
+  const DUST: u64 = 10_000;
+
+  // 2 inputs should be 2 * 230 = 460 weight units
+  // The output should be ~36 bytes, or 144 weight units
+  // The overhead should be ~20 bytes at most, or 80 weight units
+  // 684 weight units, 171 vbytes, round up to 200
+  // 200 vbytes at 1 sat/weight (our current minumum fee, 4 sat/vbyte) = 800 sat fee for the
+  // aggregation TX
+  const COST_TO_AGGREGATE: u64 = 800;
 
   // Bitcoin has a max weight of 400,000 (MAX_STANDARD_TX_WEIGHT)
   // A non-SegWit TX will have 4 weight units per byte, leaving a max size of 100,000 bytes
@@ -397,7 +470,7 @@ impl Network for Bitcoin {
   // issues in the future (if the size decreases or we mis-evaluate it)
   // It also offers a minimal amount of benefit when we are able to logarithmically accumulate
   // inputs
-  // For 128-byte inputs (40-byte output specification, 64-byte signature, whatever overhead) and
+  // For 128-byte inputs (36-byte output specification, 64-byte signature, whatever overhead) and
   // 64-byte outputs (40-byte script, 8-byte amount, whatever overhead), they together take up 192
   // bytes
   // 100,000 / 192 = 520
@@ -415,12 +488,12 @@ impl Network for Bitcoin {
     Address(BAddress::<NetworkChecked>::new(BitcoinNetwork::Bitcoin, address_payload(key).unwrap()))
   }
 
-  fn branch_address(key: ProjectivePoint) -> Self::Address {
+  fn branch_address(key: ProjectivePoint) -> Address {
     let (_, offsets, _) = scanner(key);
     Self::address(key + (ProjectivePoint::GENERATOR * offsets[&OutputType::Branch]))
   }
 
-  fn change_address(key: ProjectivePoint) -> Self::Address {
+  fn change_address(key: ProjectivePoint) -> Address {
     let (_, offsets, _) = scanner(key);
     Self::address(key + (ProjectivePoint::GENERATOR * offsets[&OutputType::Change]))
   }
@@ -435,7 +508,7 @@ impl Network for Bitcoin {
     self.rpc.get_block(&block_hash).await.map_err(|_| NetworkError::ConnectionError)
   }
 
-  async fn get_outputs(&self, block: &Self::Block, key: ProjectivePoint) -> Vec<Self::Output> {
+  async fn get_outputs(&self, block: &Self::Block, key: ProjectivePoint) -> Vec<Output> {
     let (scanner, _, kinds) = scanner(key);
 
     let mut outputs = vec![];
@@ -551,32 +624,43 @@ impl Network for Bitcoin {
 
   async fn needed_fee(
     &self,
-    _: usize,
-    plan: &Plan<Self>,
-    fee_rate: Fee,
+    block_number: usize,
+    _: &[u8; 32],
+    inputs: &[Output],
+    payments: &[Payment<Self>],
+    change: &Option<Address>,
   ) -> Result<Option<u64>, NetworkError> {
     Ok(
       self
-        .make_signable_transaction(plan, fee_rate, true)
-        .await
+        .make_signable_transaction(block_number, inputs, payments, change, true)
+        .await?
         .map(|signable| signable.needed_fee()),
     )
   }
 
   async fn signable_transaction(
     &self,
-    _: usize,
-    plan: &Plan<Self>,
-    fee_rate: Fee,
+    block_number: usize,
+    plan_id: &[u8; 32],
+    inputs: &[Output],
+    payments: &[Payment<Self>],
+    change: &Option<Address>,
   ) -> Result<Option<(Self::SignableTransaction, Self::Eventuality)>, NetworkError> {
-    Ok(self.make_signable_transaction(plan, fee_rate, false).await.map(|signable| {
-      let plan_binding_input = *plan.inputs[0].output.outpoint();
-      let outputs = signable.outputs().to_vec();
-      (
-        SignableTransaction { transcript: plan.transcript(), actual: signable },
-        Eventuality { plan_binding_input, outputs },
-      )
-    }))
+    Ok(self.make_signable_transaction(block_number, inputs, payments, change, false).await?.map(
+      |signable| {
+        let mut transcript =
+          RecommendedTranscript::new(b"Serai Processor Bitcoin Transaction Transcript");
+        transcript.append_message(b"plan", plan_id);
+
+        let plan_binding_input = *inputs[0].output.outpoint();
+        let outputs = signable.outputs().to_vec();
+
+        (
+          SignableTransaction { transcript, actual: signable },
+          Eventuality { plan_binding_input, outputs },
+        )
+      },
+    ))
   }
 
   async fn attempt_send(
@@ -619,11 +703,6 @@ impl Network for Bitcoin {
   }
 
   #[cfg(test)]
-  async fn get_fee(&self) -> Fee {
-    Fee(1)
-  }
-
-  #[cfg(test)]
   async fn mine_block(&self) {
     self
       .rpc
@@ -636,7 +715,7 @@ impl Network for Bitcoin {
   }
 
   #[cfg(test)]
-  async fn test_send(&self, address: Self::Address) -> Block {
+  async fn test_send(&self, address: Address) -> Block {
     let secret_key = SecretKey::new(&mut rand_core::OsRng);
     let private_key = PrivateKey::new(secret_key, BitcoinNetwork::Regtest);
     let public_key = PublicKey::from_private_key(SECP256K1, &private_key);

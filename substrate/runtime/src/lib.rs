@@ -17,12 +17,14 @@ pub use pallet_timestamp as timestamp;
 pub use pallet_transaction_payment as transaction_payment;
 
 pub use coins_pallet as coins;
+
+pub use validator_sets_pallet as validator_sets;
+pub use pallet_session as session;
+
 pub use in_instructions_pallet as in_instructions;
 
-pub use staking_pallet as staking;
-pub use validator_sets_pallet as validator_sets;
+pub use signals_pallet as signals;
 
-pub use pallet_session as session;
 pub use pallet_babe as babe;
 pub use pallet_grandpa as grandpa;
 
@@ -46,7 +48,7 @@ use sp_runtime::{
 use primitives::{PublicKey, SeraiAddress, AccountLookup, Signature, SubstrateAmount};
 
 use support::{
-  traits::{ConstU8, ConstU64, Contains},
+  traits::{ConstU8, ConstU32, ConstU64, Contains},
   weights::{
     constants::{RocksDbWeight, WEIGHT_REF_TIME_PER_SECOND},
     IdentityFee, Weight,
@@ -145,37 +147,50 @@ parameter_types! {
 pub struct CallFilter;
 impl Contains<RuntimeCall> for CallFilter {
   fn contains(call: &RuntimeCall) -> bool {
-    if let RuntimeCall::Timestamp(call) = call {
-      return matches!(call, timestamp::Call::set { .. });
-    }
+    match call {
+      RuntimeCall::System(call) => match call {
+        system::Call::remark { .. } => false,
+        system::Call::set_heap_pages { .. } => false,
+        system::Call::set_code { .. } => false,
+        system::Call::set_code_without_checks { .. } => false,
+        system::Call::set_storage { .. } => false,
+        system::Call::kill_storage { .. } => false,
+        system::Call::kill_prefix { .. } => false,
+        system::Call::remark_with_event { .. } => false,
+        system::Call::__Ignore(_, _) => false,
+      },
 
-    if let RuntimeCall::Coins(call) = call {
-      return matches!(call, coins::Call::transfer { .. } | coins::Call::burn { .. });
-    }
+      RuntimeCall::Timestamp(call) => match call {
+        timestamp::Call::set { .. } => true,
+        timestamp::Call::__Ignore(_, _) => false,
+      },
 
-    if let RuntimeCall::InInstructions(call) = call {
-      return matches!(call, in_instructions::Call::execute_batch { .. });
-    }
+      // All of these pallets are our own, and all of their written calls are intended to be called
+      RuntimeCall::Coins(call) => !matches!(call, coins::Call::__Ignore(_, _)),
+      RuntimeCall::ValidatorSets(call) => !matches!(call, validator_sets::Call::__Ignore(_, _)),
+      RuntimeCall::InInstructions(call) => !matches!(call, in_instructions::Call::__Ignore(_, _)),
+      RuntimeCall::Signals(call) => !matches!(call, signals::Call::__Ignore(_, _)),
 
-    if let RuntimeCall::Staking(call) = call {
-      return matches!(
-        call,
-        staking::Call::stake { .. } |
-          staking::Call::unstake { .. } |
-          staking::Call::allocate { .. } |
-          staking::Call::deallocate { .. }
-      );
-    }
+      RuntimeCall::Session(call) => match call {
+        session::Call::set_keys { .. } => true,
+        session::Call::purge_keys { .. } => false,
+        session::Call::__Ignore(_, _) => false,
+      },
 
-    if let RuntimeCall::ValidatorSets(call) = call {
-      return matches!(call, validator_sets::Call::set_keys { .. });
-    }
+      RuntimeCall::Babe(call) => match call {
+        babe::Call::report_equivocation { .. } => true,
+        babe::Call::report_equivocation_unsigned { .. } => true,
+        babe::Call::plan_config_change { .. } => false,
+        babe::Call::__Ignore(_, _) => false,
+      },
 
-    if let RuntimeCall::Session(call) = call {
-      return matches!(call, session::Call::set_keys { .. });
+      RuntimeCall::Grandpa(call) => match call {
+        grandpa::Call::report_equivocation { .. } => true,
+        grandpa::Call::report_equivocation_unsigned { .. } => true,
+        grandpa::Call::note_stalled { .. } => false,
+        grandpa::Call::__Ignore(_, _) => false,
+      },
     }
-
-    false
   }
 }
 
@@ -228,12 +243,6 @@ impl coins::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
 }
 
-impl in_instructions::Config for Runtime {
-  type RuntimeEvent = RuntimeEvent;
-}
-
-impl staking::Config for Runtime {}
-
 impl validator_sets::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
 }
@@ -251,10 +260,22 @@ impl session::Config for Runtime {
   type ValidatorIdOf = IdentityValidatorIdOf;
   type ShouldEndSession = Babe;
   type NextSessionRotation = Babe;
-  type SessionManager = Staking;
+  type SessionManager = ValidatorSets;
   type SessionHandler = <SessionKeys as OpaqueKeys>::KeyTypeIdProviders;
   type Keys = SessionKeys;
   type WeightInfo = session::weights::SubstrateWeight<Runtime>;
+}
+
+impl signals::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+  // 1 week
+  type ValidityDuration = ConstU32<{ (7 * 24 * 60 * 60) / (TARGET_BLOCK_TIME as u32) }>;
+  // 2 weeks
+  type LockInDuration = ConstU32<{ (2 * 7 * 24 * 60 * 60) / (TARGET_BLOCK_TIME as u32) }>;
+}
+
+impl in_instructions::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
 }
 
 impl babe::Config for Runtime {
@@ -321,13 +342,14 @@ construct_runtime!(
     TransactionPayment: transaction_payment,
 
     Coins: coins,
-    InInstructions: in_instructions,
 
     ValidatorSets: validator_sets,
-
-    Staking: staking,
-
     Session: session,
+
+    InInstructions: in_instructions,
+
+    Signals: signals,
+
     Babe: babe,
     Grandpa: grandpa,
 

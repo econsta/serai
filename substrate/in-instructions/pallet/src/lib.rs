@@ -71,20 +71,27 @@ pub mod pallet {
     StorageMap<_, Blake2_256, NetworkId, BlockHash, OptionQuery>;
 
   impl<T: Config> Pallet<T> {
-    fn execute(instruction: InInstructionWithBalance) -> Result<(), ()> {
+    // Use a dedicated transaction layer when executing this InInstruction
+    // This lets it individually error without causing any storage modifications
+    #[frame_support::transactional]
+    fn execute(instruction: InInstructionWithBalance) -> Result<(), DispatchError> {
       match instruction.instruction {
         InInstruction::Transfer(address) => {
-          Coins::<T>::mint(address.into(), instruction.balance).map_err(|_| ())
+          Coins::<T>::mint(address.into(), instruction.balance)?;
         }
         _ => panic!("unsupported instruction"),
       }
+      Ok(())
     }
   }
 
   fn keys_for_network<T: Config>(
     network: NetworkId,
   ) -> Result<(Session, Option<Public>, Option<Public>), InvalidTransaction> {
-    let session = ValidatorSets::<T>::session(network);
+    // If there's no session set, and therefore no keys set, then this must be an invalid signature
+    let Some(session) = ValidatorSets::<T>::session(network) else {
+      Err(InvalidTransaction::BadProof)?
+    };
     let mut set = ValidatorSet { session, network };
     let latest = ValidatorSets::<T>::keys(set).map(|keys| keys.0);
     let prior = if set.session.0 != 0 {
@@ -93,7 +100,6 @@ pub mod pallet {
     } else {
       None
     };
-    // If there's no keys set, then this must be an invalid signature
     if prior.is_none() && latest.is_none() {
       Err(InvalidTransaction::BadProof)?;
     }
@@ -109,9 +115,6 @@ pub mod pallet {
 
       let batch = batch.batch;
 
-      LastBatchBlock::<T>::insert(batch.network, frame_system::Pallet::<T>::block_number());
-
-      LastBatch::<T>::insert(batch.network, batch.id);
       LatestNetworkBlock::<T>::insert(batch.network, batch.block);
       Self::deposit_event(Event::Batch {
         network: batch.network,
@@ -120,9 +123,6 @@ pub mod pallet {
         instructions_hash: blake2_256(&batch.instructions.encode()),
       });
       for (i, instruction) in batch.instructions.into_iter().enumerate() {
-        // TODO: Check this balance's coin belongs to this network
-        // If they don't, the validator set should be completely slashed, without question
-
         if Self::execute(instruction).is_err() {
           Self::deposit_event(Event::InstructionFailure {
             network: batch.network,
@@ -153,8 +153,13 @@ pub mod pallet {
         Err(InvalidTransaction::ExhaustsResources)?;
       }
 
-      // verify the signature
       let network = batch.batch.network;
+      // Don't allow the Serai set to publish `Batch`s as-if Serai itself was an external network
+      if network == NetworkId::Serai {
+        Err(InvalidTransaction::Custom(0))?;
+      }
+
+      // verify the signature
       let (current_session, prior, current) = keys_for_network::<T>(network)?;
       let batch_message = batch_message(&batch.batch);
       // Check the prior key first since only a single `Batch` (the last one) will be when prior is
@@ -187,6 +192,7 @@ pub mod pallet {
       if last_block >= current_block {
         Err(InvalidTransaction::Future)?;
       }
+      LastBatchBlock::<T>::insert(batch.batch.network, frame_system::Pallet::<T>::block_number());
 
       // Verify the batch is sequential
       // LastBatch has the last ID set. The next ID should be it + 1
@@ -197,6 +203,21 @@ pub mod pallet {
       }
       if batch.batch.id > expected {
         Err(InvalidTransaction::Future)?;
+      }
+      LastBatch::<T>::insert(batch.batch.network, batch.batch.id);
+
+      // Verify all Balances in this Batch are for this network
+      for instruction in &batch.batch.instructions {
+        // Verify this coin is for this network
+        // If this is ever hit, it means the validator set has turned malicious and should be fully
+        // slashed
+        // Because we have an error here, no validator set which turns malicious should execute
+        // this code path
+        // Accordingly, there's no value in writing code to fully slash the network, when such an
+        // even would require a runtime upgrade to fully resolve anyways
+        if instruction.balance.coin.network() != batch.batch.network {
+          Err(InvalidTransaction::Custom(1))?;
+        }
       }
 
       ValidTransaction::with_tag_prefix("in-instructions")
