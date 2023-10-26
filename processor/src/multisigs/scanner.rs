@@ -33,8 +33,8 @@ pub type ScannerEventChannel<N> = mpsc::UnboundedReceiver<ScannerEvent<N>>;
 
 create_db!(
   ScannerDb {
-    BlockKeyDb: (number: [u8; 8]) -> Vec<u8>,
-    BlockNumberKeyDb: (id: Vec<u8>) -> Vec<u8>,
+    BlockKeyDb: (number: u64) -> Vec<u8>,
+    BlockNumberKeyDb: (id: Vec<u8>) -> u64,
     KeysDb: () -> Vec<u8>,
     SeenDb: (id: Vec<u8>) -> Vec<u8>,
     OutputsDb: (block: Vec<u8>) -> Vec<u8>,
@@ -44,25 +44,23 @@ create_db!(
 );
 
 impl BlockKeyDb {
-  fn to_block_key(number: usize) -> [u8; 8] {
-    u64::try_from(number).unwrap().to_le_bytes()
-  }
 
   fn save_block<N: Network>(txn: &mut impl DbTxn, number: usize, id: &<N::Block as Block<N>>::Id) {
     Self::set(
       txn,
-      Self::to_block_key(number),
+      number.try_into().unwrap(),
       &BlockNumberKeyDb::to_block_number_key::<N>(id)
     );
+    let data: u64 = number.try_into().unwrap();
     BlockNumberKeyDb::set(
       txn,
       BlockNumberKeyDb::to_block_number_key::<N>(id),
-      &Self::to_block_key(number)
+      &data
     );
   }
 
   fn block<N: Network>(getter: &impl Get, number: usize) -> Option<<N::Block as Block<N>>::Id> {
-    Self::get(getter, Self::to_block_key(number)).map(|bytes| {
+    Self::get(getter, number.try_into().unwrap()).map(|bytes| {
       let mut res = <N::Block as Block<N>>::Id::default();
       res.as_mut().copy_from_slice(&bytes);
       res
@@ -76,9 +74,8 @@ impl BlockNumberKeyDb {
   }
 
   fn block_number<N: Network>(getter: &impl Get, id: &<N::Block as Block<N>>::Id) -> Option<usize> {
-    Self::get(getter, Self::to_block_number_key::<N>(id)).map(|bytes| {
-      u64::from_le_bytes(bytes.try_into().unwrap()).try_into().unwrap()
-    })
+    let key = Self::to_block_number_key::<N>(id);
+    Some(Self::get(getter, key).unwrap() as usize)
   }
 }
 
@@ -88,7 +85,7 @@ impl KeysDb {
     activation_number: usize,
     key: <N::Curve as Ciphersuite>::G,
   ) {
-    let mut keys = txn.get(Self::key()).unwrap_or_default();
+    let mut keys = Self::get(txn).unwrap_or_default();
     let key_bytes = key.to_bytes();
     let key_len = key_bytes.as_ref().len();
     assert_eq!(keys.len() % (8 + key_len), 0);
@@ -108,7 +105,7 @@ impl KeysDb {
   }
 
   fn keys<N: Network>(getter: &impl Get) -> Vec<(usize, <N::Curve as Ciphersuite>::G)> {
-    let bytes_vec = getter.get(Self::key()).unwrap_or_default();
+    let bytes_vec = Self::get(getter).unwrap_or_default();
     let mut bytes: &[u8] = bytes_vec.as_ref();
 
     // Assumes keys will be 32 bytes when calculating the capacity
@@ -119,9 +116,7 @@ impl KeysDb {
     while !bytes.is_empty() {
       let mut activation_number = [0; 8];
       bytes.read_exact(&mut activation_number).unwrap();
-      let activation_number = u64::from_le_bytes(activation_number).try_into().unwrap();
-
-      res.push((activation_number, N::Curve::read_G(&mut bytes).unwrap()));
+      res.push((u64::from_le_bytes(activation_number).try_into().unwrap(), N::Curve::read_G(&mut bytes).unwrap()));
     }
     res
   }

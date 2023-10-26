@@ -55,7 +55,7 @@ create_db!(
     CurrentlyCompletingKeyPairDb: (genesis: [u8; 32]) -> KeyPair,
     KeyPairDb: (set: ValidatorSet) -> KeyPair,
     AttemptDb: (key: Vec<u8>) -> Vec<u8>,
-    DataReceivedDb: (key: &Vec<u8>) -> Vec<u8>,
+    DataReceivedDb: (key: &Vec<u8>) -> u16,
     DataDb: (spec: Vec<u8>, signer: [u8; 32]) -> Vec<u8>,
     TributaryEventDb: (key: Vec<u8>) -> Vec<u8>
   }

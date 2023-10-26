@@ -140,7 +140,7 @@ impl ForwardedOutputDb {
     txn: &mut impl DbTxn,
     amount: u64,
   ) -> Option<InInstructionWithBalance> {
-    let outputs = Self::get(txn, amount).unwrap();
+    let outputs = Self::get(txn, amount)?;
     let mut outputs_ref = outputs.as_slice();
     let res = InInstructionWithBalance::decode(&mut outputs_ref).unwrap();
     assert!(outputs_ref.len() < outputs.len());

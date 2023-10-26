@@ -826,7 +826,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
 
         let mut block_hash = [0; 32];
         block_hash.copy_from_slice(block.as_ref());
-        let mut batch_id = NextBatchDb::get(txn).unwrap();
+        let mut batch_id = NextBatchDb::get(txn).unwrap_or_default();
 
         // start with empty batch
         let mut batches = vec![Batch {

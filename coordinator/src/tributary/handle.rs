@@ -182,12 +182,9 @@ pub(crate) async fn handle_application_tx<
 
     // Store this data
     let recvd_key = data_spec.as_key(genesis);
-    let mut received = DataReceivedDb::get(txn, &recvd_key)
-      .and_then(|bytes| bytes.try_into().ok())
-      .map(u16::from_le_bytes)
-      .unwrap_or(0);
+    let mut received = DataReceivedDb::get(txn, &recvd_key).unwrap_or(0);
     received += 1;
-    DataReceivedDb::set(txn,&recvd_key, &received.to_le_bytes());
+    DataReceivedDb::set(txn,&recvd_key, &received);
     DataDb::set(txn, data_spec.as_key(genesis), signed.signer.to_bytes() as [u8; 32], &bytes);
 
     // If we have all the needed commitments/preprocesses/shares, tell the processor

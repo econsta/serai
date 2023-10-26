@@ -53,7 +53,7 @@ impl CompletedOnChainDb {
     ActiveSignsDb::set(
       txn,
       &ActiveSignsDb::get(txn)
-        .unwrap()
+        .unwrap_or_default()
         .into_iter()
         .filter(|active| active != id)
         .flatten()
@@ -166,7 +166,7 @@ impl<N: Network, D: Db> Signer<N, D> {
   pub async fn rebroadcast_task(db: D, network: N) {
     log::info!("rebroadcasting transactions for plans whose completions yet to be confirmed...");
     loop {
-      for active in ActiveSignsDb::get(&db).unwrap() {
+      for active in ActiveSignsDb::get(&db).unwrap_or_default() {
         for completion in CompletedDb::completions::<N>(&db, active) {
           log::info!("rebroadcasting {}", hex::encode(&completion));
           // TODO: Don't drop the error entirely. Check for invariants
