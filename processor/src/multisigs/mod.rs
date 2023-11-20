@@ -26,7 +26,7 @@ pub mod scanner;
 use scanner::{ScannerEvent, ScannerHandle, Scanner};
 
 mod db;
-use db::MultisigsDb;
+use db::*;
 
 #[cfg(not(test))]
 mod scheduler;
@@ -175,7 +175,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
       // Load any TXs being actively signed
       let key = key.to_bytes();
       for (block_number, plan, operating_costs) in
-        MultisigsDb::<N, D>::active_plans(raw_db, key.as_ref())
+        PlanDb::active_plans::<N>(raw_db, key.as_ref())
       {
         let block_number = block_number.try_into().unwrap();
 
@@ -557,12 +557,12 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         }
         OutputType::Change => {
           // If the TX containing this output resolved an Eventuality...
-          if let Some(plan) = MultisigsDb::<N, D>::resolved_plan(txn, output.tx_id()) {
+          if let Some(plan) = ResolvedDb::get(txn, output.tx_id().as_ref()) {
             // And the Eventuality had change...
             // We need this check as Eventualities have a race condition and can't be relied
             // on, as extensively detailed above. Eventualities explicitly with change do have
             // a safe timing window however
-            if MultisigsDb::<N, D>::plan_by_key_with_self_change(
+            if PlanDb::plan_by_key_with_self_change::<N>(
               txn,
               // Pass the key so the DB checks the Plan's key is this multisig's, preventing a
               // potential issue where the new multisig creates a Plan with change *and a
@@ -590,7 +590,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
   async fn plans_from_block(
     &mut self,
     txn: &mut D::Transaction<'_>,
-    block_number: usize,
+    block_number: u64,
     block_id: <N::Block as Block<N>>::Id,
     step: &mut RotationStep,
     burns: Vec<OutInstructionWithBalance>,
@@ -608,7 +608,7 @@ impl<D: Db, N: Network> MultisigManager<D, N> {
         block_number
       {
         // Load plans crated when we scanned the block
-        plans = MultisigsDb::<N, D>::take_plans_from_scanning(txn, block_number).unwrap();
+        plans = PlansFromScanningDb::take_plans_from_scanning::<N>(txn, block_number).unwrap();
         for plan in &plans {
           plans_from_scanning.insert(plan.id());
         }
