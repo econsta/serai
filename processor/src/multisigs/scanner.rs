@@ -16,6 +16,7 @@ use tokio::{
   time::sleep,
 };
 
+use scale::Encode;
 use crate::{
   Get, DbTxn, Db,
   networks::{Output, Transaction, EventualitiesTracker, Block, Network},
@@ -26,7 +27,7 @@ pub enum ScannerEvent<N: Network> {
   // Block scanned
   Block { is_retirement_block: bool, block: <N::Block as Block<N>>::Id, outputs: Vec<N::Output> },
   // Eventuality completion found on-chain
-  Completed(Vec<u8>, u64, [u8; 32], N::Transaction),
+  Completed(Vec<u8>, usize, [u8; 32], N::Transaction),
 }
 
 pub type ScannerEventChannel<N> = mpsc::UnboundedReceiver<ScannerEvent<N>>;
@@ -45,20 +46,20 @@ create_db!(
 
 impl BlockKeyDb {
 
-  fn save_block<N: Network>(txn: &mut impl DbTxn, number: u64, id: &<N::Block as Block<N>>::Id) {
+  fn save_block<N: Network>(txn: &mut impl DbTxn, number: usize, id: &<N::Block as Block<N>>::Id) {
     Self::set(
       txn,
-      number,
+      u64::try_from(number).unwrap(),
       &BlockNumberKeyDb::to_block_number_key::<N>(id)
     );
     BlockNumberKeyDb::set(
       txn,
       BlockNumberKeyDb::to_block_number_key::<N>(id),
-      &number
+      &u64::try_from(number).unwrap()
     );
   }
 
-  fn block<N: Network>(getter: &impl Get, number: u64) -> Option<<N::Block as Block<N>>::Id> {
+  fn block<N: Network>(getter: &impl Get, number: usize) -> Option<<N::Block as Block<N>>::Id> {
     Self::get(getter, number.try_into().unwrap()).map(|bytes| {
       let mut res = <N::Block as Block<N>>::Id::default();
       res.as_mut().copy_from_slice(&bytes);
@@ -72,16 +73,16 @@ impl BlockNumberKeyDb {
     id.as_ref().into()
   }
 
-  fn block_number<N: Network>(getter: &impl Get, id: &<N::Block as Block<N>>::Id) -> Option<u64> {
+  fn block_number<N: Network>(getter: &impl Get, id: &<N::Block as Block<N>>::Id) -> Option<usize> {
     let key = Self::to_block_number_key::<N>(id);
-    Self::get(getter, key)
+    Self::get(getter, key).map(|number| usize::try_from(number).unwrap())  
   }
 }
 
 impl KeysDb {
   fn register_key<N: Network>(
     txn: &mut impl DbTxn,
-    activation_number: u64,
+    activation_number: usize,
     key: <N::Curve as Ciphersuite>::G,
   ) {
     let mut keys = Self::get(txn).unwrap_or_default();
@@ -103,7 +104,7 @@ impl KeysDb {
     Self::set(txn, &keys);
   }
 
-  fn keys<N: Network>(getter: &impl Get) -> Vec<(u64, <N::Curve as Ciphersuite>::G)> {
+  fn keys<N: Network>(getter: &impl Get) -> Vec<(usize, <N::Curve as Ciphersuite>::G)> {
     let bytes_vec = Self::get(getter).unwrap_or_default();
     let mut bytes: &[u8] = bytes_vec.as_ref();
 
@@ -171,7 +172,7 @@ impl OutputsDb {
 }
 
 impl ScannedBlocksDb {
-  fn save_scanned_block<N: Network>(txn: &mut impl DbTxn, block: u64) -> Vec<N::Output> {
+  fn save_scanned_block<N: Network>(txn: &mut impl DbTxn, block: usize) -> Vec<N::Output> {
     let id = BlockKeyDb::block::<N>(txn, block);
     let outputs = id.as_ref().and_then(|id| OutputsDb::outputs::<N>(txn, id)).unwrap_or_default();
     
@@ -179,10 +180,15 @@ impl ScannedBlocksDb {
     for output in &outputs {
       SeenDb::set(txn, SeenDb::to_seen_key::<N>(&output.id()), b"");
     }
-    Self::set(txn, &u64::try_from(block).unwrap().to_le_bytes());
+    Self::set(txn, &u64::try_from(block).unwrap());
 
     // Return this block's outputs so they can be pruned from the RAM cache
     outputs
+  }
+
+  fn latest_scanned_block(getter: &impl Get) -> Option<usize> {
+    Self::get(getter)
+      .map(|number| usize::try_from(number).unwrap())
   }
 }
 
@@ -194,175 +200,16 @@ impl RetirementBlocksDb {
   fn save_retirement_block<N: Network>(
     txn: &mut impl DbTxn,
     key: &<N::Curve as Ciphersuite>::G,
-    block: u64,
+    block: usize,
   ) {
-    Self::set(txn, Self::to_retirement_block_key::<N>(key), &block);
+    Self::set(txn, Self::to_retirement_block_key::<N>(key), &u64::try_from(block).unwrap());
   }
 
-  fn retirement_block<N: Network>(getter: &impl Get, key: &<N::Curve as Ciphersuite>::G) -> Option<u64> {
-    Self::get(getter, Self::to_retirement_block_key::<N>(key))
+  fn retirement_block<N: Network>(getter: &impl Get, key: &<N::Curve as Ciphersuite>::G) -> Option<usize> {
+    Self::get(getter, Self::to_retirement_block_key::<N>(key)).map(|number| usize::try_from(number).unwrap())  
   }
 }
 
-// #[derive(Clone, Debug)]
-// struct ScannerDb<N: Network, D: Db>(PhantomData<N>, PhantomData<D>);
-// impl<N: Network, D: Db> ScannerDb<N, D> {
-//   fn scanner_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-//     D::key(b"SCANNER", dst, key)
-//   }
-
-//   fn block_key(number: usize) -> Vec<u8> {
-//     Self::scanner_key(b"block_id", u64::try_from(number).unwrap().to_le_bytes())
-//   }
-//   fn block_number_key(id: &<N::Block as Block<N>>::Id) -> Vec<u8> {
-//     Self::scanner_key(b"block_number", id)
-//   }
-//   fn save_block(txn: &mut D::Transaction<'_>, number: usize, id: &<N::Block as Block<N>>::Id) {
-//     txn.put(Self::block_number_key(id), u64::try_from(number).unwrap().to_le_bytes());
-//     txn.put(Self::block_key(number), id);
-//   }
-//   fn block<G: Get>(getter: &G, number: usize) -> Option<<N::Block as Block<N>>::Id> {
-//     getter.get(Self::block_key(number)).map(|id| {
-//       let mut res = <N::Block as Block<N>>::Id::default();
-//       res.as_mut().copy_from_slice(&id);
-//       res
-//     })
-//   }
-//   fn block_number<G: Get>(getter: &G, id: &<N::Block as Block<N>>::Id) -> Option<u64> {
-//     getter
-//       .get(Self::block_number_key(id))
-//       .map(|number| u64::from_le_bytes(number.try_into().unwrap()).try_into().unwrap())
-//   }
-
-//   fn keys_key() -> Vec<u8> {
-//     Self::scanner_key(b"keys", b"")
-//   }
-//   fn register_key(
-//     txn: &mut D::Transaction<'_>,
-//     activation_number: usize,
-//     key: <N::Curve as Ciphersuite>::G,
-//   ) {
-//     let mut keys = txn.get(Self::keys_key()).unwrap_or(vec![]);
-
-//     let key_bytes = key.to_bytes();
-
-//     let key_len = key_bytes.as_ref().len();
-//     assert_eq!(keys.len() % (8 + key_len), 0);
-
-//     // Sanity check this key isn't already present
-//     let mut i = 0;
-//     while i < keys.len() {
-//       if &keys[(i + 8) .. ((i + 8) + key_len)] == key_bytes.as_ref() {
-//         panic!("adding {} as a key yet it was already present", hex::encode(key_bytes));
-//       }
-//       i += 8 + key_len;
-//     }
-
-//     keys.extend(u64::try_from(activation_number).unwrap().to_le_bytes());
-//     keys.extend(key_bytes.as_ref());
-//     txn.put(Self::keys_key(), keys);
-//   }
-//   fn keys<G: Get>(getter: &G) -> Vec<(usize, <N::Curve as Ciphersuite>::G)> {
-//     let bytes_vec = getter.get(Self::keys_key()).unwrap_or(vec![]);
-//     let mut bytes: &[u8] = bytes_vec.as_ref();
-
-//     // Assumes keys will be 32 bytes when calculating the capacity
-//     // If keys are larger, this may allocate more memory than needed
-//     // If keys are smaller, this may require additional allocations
-//     // Either are fine
-//     let mut res = Vec::with_capacity(bytes.len() / (8 + 32));
-//     while !bytes.is_empty() {
-//       let mut activation_number = [0; 8];
-//       bytes.read_exact(&mut activation_number).unwrap();
-//       let activation_number = u64::from_le_bytes(activation_number).try_into().unwrap();
-
-//       res.push((activation_number, N::Curve::read_G(&mut bytes).unwrap()));
-//     }
-//     res
-//   }
-//   fn retire_key(txn: &mut D::Transaction<'_>) {
-//     let keys = Self::keys(txn);
-//     assert_eq!(keys.len(), 2);
-//     txn.del(Self::keys_key());
-//     Self::register_key(txn, keys[1].0, keys[1].1);
-//   }
-
-//   fn seen_key(id: &<N::Output as Output<N>>::Id) -> Vec<u8> {
-//     Self::scanner_key(b"seen", id)
-//   }
-//   fn seen<G: Get>(getter: &G, id: &<N::Output as Output<N>>::Id) -> bool {
-//     getter.get(Self::seen_key(id)).is_some()
-//   }
-
-//   fn outputs_key(block: &<N::Block as Block<N>>::Id) -> Vec<u8> {
-//     Self::scanner_key(b"outputs", block.as_ref())
-//   }
-//   fn save_outputs(
-//     txn: &mut D::Transaction<'_>,
-//     block: &<N::Block as Block<N>>::Id,
-//     outputs: &[N::Output],
-//   ) {
-//     let mut bytes = Vec::with_capacity(outputs.len() * 64);
-//     for output in outputs {
-//       output.write(&mut bytes).unwrap();
-//     }
-//     txn.put(Self::outputs_key(block), bytes);
-//   }
-//   fn outputs(
-//     txn: &D::Transaction<'_>,
-//     block: &<N::Block as Block<N>>::Id,
-//   ) -> Option<Vec<N::Output>> {
-//     let bytes_vec = txn.get(Self::outputs_key(block))?;
-//     let mut bytes: &[u8] = bytes_vec.as_ref();
-
-//     let mut res = vec![];
-//     while !bytes.is_empty() {
-//       res.push(N::Output::read(&mut bytes).unwrap());
-//     }
-//     Some(res)
-//   }
-
-//   fn scanned_block_key() -> Vec<u8> {
-//     Self::scanner_key(b"scanned_block", [])
-//   }
-
-//   fn save_scanned_block(txn: &mut D::Transaction<'_>, block: usize) -> Vec<N::Output> {
-//     let id = Self::block(txn, block); // It may be None for the first key rotated to
-//     let outputs =
-//       if let Some(id) = id.as_ref() { Self::outputs(txn, id).unwrap_or(vec![]) } else { vec![] };
-
-//     // Mark all the outputs from this block as seen
-//     for output in &outputs {
-//       txn.put(Self::seen_key(&output.id()), b"");
-//     }
-
-//     txn.put(Self::scanned_block_key(), u64::try_from(block).unwrap().to_le_bytes());
-
-//     // Return this block's outputs so they can be pruned from the RAM cache
-//     outputs
-//   }
-//   fn latest_scanned_block<G: Get>(getter: &G) -> Option<usize> {
-//     getter
-//       .get(Self::scanned_block_key())
-//       .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()).try_into().unwrap())
-//   }
-
-//   fn retirement_block_key(key: &<N::Curve as Ciphersuite>::G) -> Vec<u8> {
-//     Self::scanner_key(b"retirement_block", key.to_bytes())
-//   }
-//   fn save_retirement_block(
-//     txn: &mut D::Transaction<'_>,
-//     key: &<N::Curve as Ciphersuite>::G,
-//     block: usize,
-//   ) {
-//     txn.put(Self::retirement_block_key(key), u64::try_from(block).unwrap().to_le_bytes());
-//   }
-//   fn retirement_block<G: Get>(getter: &G, key: &<N::Curve as Ciphersuite>::G) -> Option<usize> {
-//     getter
-//       .get(Self::retirement_block_key(key))
-//       .map(|bytes| usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap())).unwrap())
-//   }
-// }
 
 /// The Scanner emits events relating to the blockchain, notably received outputs.
 ///
@@ -373,14 +220,14 @@ impl RetirementBlocksDb {
 pub struct Scanner<N: Network, D: Db> {
   _db: PhantomData<D>,
 
-  keys: Vec<(u64, <N::Curve as Ciphersuite>::G)>,
+  keys: Vec<(usize, <N::Curve as Ciphersuite>::G)>,
 
   eventualities: HashMap<Vec<u8>, EventualitiesTracker<N::Eventuality>>,
 
-  ram_scanned: Option<u64>,
+  ram_scanned: Option<usize>,
   ram_outputs: HashSet<Vec<u8>>,
 
-  need_ack: VecDeque<u64>,
+  need_ack: VecDeque<usize>,
 
   events: mpsc::UnboundedSender<ScannerEvent<N>>,
 }
@@ -431,7 +278,7 @@ pub struct ScannerHandle<N: Network, D: Db> {
 }
 
 impl<N: Network, D: Db> ScannerHandle<N, D> {
-  pub async fn ram_scanned(&self) -> u64 {
+  pub async fn ram_scanned(&self) -> usize {
     self.scanner.read().await.as_ref().unwrap().ram_scanned.unwrap_or(0)
   }
 
@@ -439,7 +286,7 @@ impl<N: Network, D: Db> ScannerHandle<N, D> {
   pub async fn register_key(
     &mut self,
     txn: &mut D::Transaction<'_>,
-    activation_number: u64,
+    activation_number: usize,
     key: <N::Curve as Ciphersuite>::G,
   ) {
     let mut scanner_lock = self.scanner.write().await;
@@ -465,14 +312,14 @@ impl<N: Network, D: Db> ScannerHandle<N, D> {
     scanner.eventualities.insert(key.to_bytes().as_ref().to_vec(), EventualitiesTracker::new());
   }
 
-  pub fn db_scanned<G: Get>(getter: &G) -> Option<u64> {
-    ScannedBlocksDb::get(getter)
+  pub fn db_scanned<G: Get>(getter: &G) -> Option<usize> {
+    ScannedBlocksDb::get(getter).map(|number| usize::try_from(number).unwrap())
   }
 
   // This perform a database read which isn't safe with regards to if the value is set or not
   // It may be set, when it isn't expected to be set, or not set, when it is expected to be set
   // Since the value is static, if it's set, it's correctly set
-  pub fn block_number<G: Get>(getter: &G, id: &<N::Block as Block<N>>::Id) -> Option<u64> {
+  pub fn block_number(getter: &impl Get, id: &<N::Block as Block<N>>::Id) -> Option<usize> {
     BlockNumberKeyDb::block_number::<N>(getter, id)
   }
 
@@ -520,7 +367,7 @@ impl<N: Network, D: Db> ScannerHandle<N, D> {
   pub async fn register_eventuality(
     &mut self,
     key: &[u8],
-    block_number: u64,
+    block_number: usize,
     id: [u8; 32],
     eventuality: N::Eventuality,
   ) {
@@ -548,7 +395,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
   pub fn new(
     network: N,
     db: D,
-  ) -> (ScannerHandle<N, D>, Vec<(u64, <N::Curve as Ciphersuite>::G)>) {
+  ) -> (ScannerHandle<N, D>, Vec<(usize, <N::Curve as Ciphersuite>::G)>) {
     let (events_send, events_recv) = mpsc::unbounded_channel();
     let (multisig_completed_send, multisig_completed_recv) = mpsc::unbounded_channel();
 
@@ -558,7 +405,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
       eventualities.insert(key.1.to_bytes().as_ref().to_vec(), EventualitiesTracker::new());
     }
 
-    let ram_scanned = ScannedBlocksDb::get(&db);
+    let ram_scanned = ScannedBlocksDb::latest_scanned_block(&db);
 
     let scanner = ScannerHold {
       scanner: Arc::new(RwLock::new(Some(Scanner {
@@ -625,7 +472,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
           // and demonstrated with mini
           if let Some(needing_ack) = scanner.need_ack.front() {
             let next = ram_scanned + 1;
-            let limit = needing_ack + u64::try_from(N::CONFIRMATIONS).unwrap();
+            let limit = needing_ack + N::CONFIRMATIONS;
             assert!(next <= limit);
             if next == limit {
               continue;
@@ -641,7 +488,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
             break match network.get_latest_block_number().await {
               // Only scan confirmed blocks, which we consider effectively finalized
               // CONFIRMATIONS - 1 as whatever's in the latest block already has 1 confirm
-              Ok(latest) => u64::try_from(latest.saturating_sub(N::CONFIRMATIONS.saturating_sub(1))).unwrap(),
+              Ok(latest) => latest.saturating_sub(N::CONFIRMATIONS.saturating_sub(1)),
               Err(_) => {
                 warn!("couldn't get latest block number");
                 sleep(Duration::from_secs(60)).await;
@@ -662,7 +509,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
           };
 
           if let Some(needing_ack) = needing_ack {
-            let limit = needing_ack + u64::try_from(N::CONFIRMATIONS).unwrap();
+            let limit = needing_ack + N::CONFIRMATIONS;
             assert!(block_being_scanned <= limit);
             if block_being_scanned == limit {
               break;
@@ -701,7 +548,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
           }
 
           let mut txn = db.txn();
-          BlockKeyDb::save_block(&mut txn, block_being_scanned, &block_id);
+          BlockKeyDb::save_block::<N>(&mut txn, block_being_scanned, &block_id);
           txn.commit();
         }
 
@@ -744,7 +591,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
 
             completion_block_numbers.push(block_number);
             // This must be before the mission of ScannerEvent::Block, per commentary in mod.rs
-            if !scanner.emit(ScannerEvent::Completed(key_vec.clone(), u64::try_from(block_number).unwrap(), id, tx)).await {
+            if !scanner.emit(ScannerEvent::Completed(key_vec.clone(), block_number, id, tx)).await {
               return;
             }
           }
@@ -791,7 +638,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
 
             TODO2: Only update ram_outputs after committing the TXN in question.
           */
-          let seen = ScannerDb::<N, D>::seen(&db, &id);
+          let seen = SeenDb::seen::<N>(&db, &id);
           let id = id.as_ref().to_vec();
           if seen || scanner.ram_outputs.contains(&id) {
             panic!("scanned an output multiple times");
@@ -806,7 +653,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
         async fn check_multisig_completed<N: Network, D: Db>(
           db: &mut D,
           multisig_completed: &mut mpsc::UnboundedReceiver<bool>,
-          block_number: u64,
+          block_number: usize,
         ) -> bool {
           match multisig_completed.recv().await {
             None => {
@@ -818,9 +665,9 @@ impl<N: Network, D: Db> Scanner<N, D> {
               if completed {
                 let mut txn = db.txn();
                 // The retiring key is the earliest one still around
-                let retiring_key = ScannerDb::<N, D>::keys(&txn)[0].1;
+                let retiring_key = KeysDb::keys::<N>(&txn)[0].1;
                 // This value is static w.r.t. the key
-                ScannerDb::<N, D>::save_retirement_block(
+                RetirementBlocksDb::save_retirement_block::<N>(
                   &mut txn,
                   &retiring_key,
                   block_number + N::CONFIRMATIONS,
@@ -837,7 +684,7 @@ impl<N: Network, D: Db> Scanner<N, D> {
         // channel before we decide if this block should be fired or not
         // (holding the Scanner risks a deadlock)
         for block_number in completion_block_numbers {
-          if !check_multisig_completed::<N, _>(&mut db, &mut multisig_completed, block_number).await
+          if !check_multisig_completed::<N, _>(&mut db, &mut multisig_completed, block_number.try_into().unwrap()).await
           {
             return;
           };
@@ -853,11 +700,11 @@ impl<N: Network, D: Db> Scanner<N, D> {
         // - There's outputs
         // as only those blocks are meaningful and warrant obtaining synchrony over
         let is_retirement_block =
-          ScannerDb::<N, D>::retirement_block(&db, &scanner.keys[0].1) == Some(block_being_scanned);
+        RetirementBlocksDb::retirement_block::<N>(&db, &scanner.keys[0].1) == Some(block_being_scanned);
         let sent_block = if has_activation || is_retirement_block || (!outputs.is_empty()) {
           // Save the outputs to disk
           let mut txn = db.txn();
-          ScannerDb::<N, D>::save_outputs(&mut txn, &block_id, &outputs);
+          OutputsDb::save_outputs::<N>(&mut txn, &block_id, &outputs);
           txn.commit();
 
           // Send all outputs
